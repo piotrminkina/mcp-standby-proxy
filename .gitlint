@@ -1,0 +1,9 @@
+[general]
+contrib = contrib-title-conventional-commits
+regex-style-search = true
+
+[title-max-length]
+line-length = 72
+
+[contrib-title-conventional-commits]
+types = feat,fix,docs,style,refactor,test,chore

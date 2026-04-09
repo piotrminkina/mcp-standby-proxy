@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v gitlint &>/dev/null; then
+    gitlint --msg-filename "$1"
+fi
