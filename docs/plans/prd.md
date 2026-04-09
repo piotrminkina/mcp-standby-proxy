@@ -2,7 +2,7 @@
 
 **Status:** PROPOSED
 **Date:** 2026-04-09
-**Related:** [Tech Stack](tech-stack.md)
+**Related:** [Tech Stack](tech-stack.md) | [Tech Spec](tech-spec.md) | [Config Spec](config-spec.md)
 
 ---
 

@@ -2,7 +2,7 @@
 
 **Status:** APPROVED
 **Date:** 2026-04-09
-**Related:** [PRD](prd.md)
+**Related:** [PRD](prd.md) | [Tech Spec](tech-spec.md) | [Config Spec](config-spec.md)
 
 ---
 

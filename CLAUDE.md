@@ -25,41 +25,15 @@ command docker compose run --rm dev bash
 
 ## Architecture
 
-### Hybrid MCP SDK Approach (AD-6)
+See [Tech Spec](docs/plans/tech-spec.md) for runtime architecture (transport protocol,
+concurrency model, key flows) and [Config Spec](docs/plans/config-spec.md) for
+configuration schema and cache format.
 
-- **Client side (MCP client -> proxy):** Raw stdio JSON-RPC. Read lines from stdin,
-  parse JSON, route. Full control over caching and `initialize` response.
-- **Backend side (proxy -> real server):** MCP SDK transport context managers
-  (`sse_client()`, `streamablehttp_client()`, `stdio_client()`). Use explicit
-  `__aenter__()`/`__aexit__()` — the connection spans the proxy's session lifetime.
-- **Forwarding transparency:** For all proxied requests (`tools/call`, `resources/read`),
-  operate at the raw `JSONRPCMessage` layer. Only remap the `id` field. Never parse
-  the `result` payload. Use `ClientSession.call_tool()` / `list_tools()` ONLY for
-  cache bootstrap and schema refresh.
-
-### State Machine
-
-Six states: Cold, Starting, Healthy, Active, Failed, Stopping.
-
-- State transitions are serialized via a single `asyncio.Lock` — no concurrent transitions.
+Key operational rules for implementation:
+- State transitions are serialized via `asyncio.Lock` — no concurrent transitions.
 - Requests arriving during transitional states (Starting, Stopping) are queued.
 - Stopping always completes before restart — never cancel a stop mid-execution.
-- On `tools/call` during Stopping: queue, let stop finish, then Cold -> Starting.
-
-### Cache Format
-
-```json
-{
-  "cache_version": 1,
-  "capabilities": {"tools": {"listChanged": true}},
-  "tools/list": {"tools": [...]},
-  "resources/list": {"resources": [...]},
-  "prompts/list": {"prompts": [...]}
-}
-```
-
-On load: if `cache_version` is missing, lower, or higher than current — delete and
-trigger cold bootstrap.
+- For all proxied requests, operate at raw `JSONRPCMessage` layer — only remap `id`.
 
 ## Coding Conventions
 
