@@ -1,0 +1,23 @@
+version: 1
+server:
+  name: "kroki"
+  version: "1.0.0"
+backend:
+  transport: sse
+  url: "http://localhost:5090/sse"
+lifecycle:
+  start:
+    command: "systemctl"
+    args: ["--user", "start", "kroki.socket"]
+  stop:
+    command: "systemctl"
+    args: ["--user", "stop", "kroki-proxy.service"]
+  healthcheck:
+    type: http
+    url: "http://localhost:5090/sse"
+    interval: 1
+    max_attempts: 60
+  idle_timeout: 300
+cache:
+  path: "./kroki_cache.json"
+  auto_refresh: true
