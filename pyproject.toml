@@ -24,6 +24,7 @@ dev = [
   "pytest-asyncio",
   "ruff",
   "mypy",
+  "uvicorn",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -32,6 +33,10 @@ packages = ["src/mcp_standby_proxy"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "-m 'not smoke'"
+markers = [
+  "smoke: tests requiring a real MCP server (not run by default)",
+]
 
 [tool.ruff]
 line-length = 99
