@@ -1,0 +1,25 @@
+{
+  "name": "mcp-standby-proxy",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "..",
+    "target": "dev"
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "workspaceFolder": "/workspace",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "username": "devcontainer",
+      "installZsh": false,
+      "installOhMyZsh": false,
+      "installOhMyZshConfig": false,
+      "upgradePackages": false,
+      "installSsl": false
+    }
+  },
+  "remoteUser": "devcontainer",
+  "containerEnv": {
+    "UV_LINK_MODE": "copy"
+  },
+  "postCreateCommand": "test -f pyproject.toml && uv sync || true"
+}

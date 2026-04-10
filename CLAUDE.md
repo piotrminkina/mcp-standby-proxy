@@ -9,19 +9,35 @@ schemas on startup and starts backends on-demand when the agent calls a tool. On
 instance per MCP server, configured via YAML. See [PRD](docs/plans/prd.md) for requirements
 and [Tech Stack](docs/plans/tech-stack.md) for technology choices.
 
-## Running Project Commands
+## Development Environment
+
+The project uses a **DevContainer** for full isolation of dependencies from the host OS.
+See [ADR-001](docs/adr/ADR-001-devcontainer-isolation.md) for rationale.
+
+**Container engine:** Podman (whitelistable in Claude Code sandbox; Docker works too).
+
+### Starting the DevContainer
 
 ```bash
-uv sync                                        # Install dependencies
-uv run mcp-standby-proxy serve -c config.yaml  # Run the proxy
-uv run pytest                                  # Run tests
+devcontainer up --workspace-folder . --docker-path podman
 ```
 
-For Nuitka builds (post-MVP), use the Docker Compose `dev` service:
+### Running commands inside the DevContainer
 
 ```bash
-command docker compose run --rm dev bash
+devcontainer exec --workspace-folder . --docker-path podman uv sync
+devcontainer exec --workspace-folder . --docker-path podman uv run pytest
+devcontainer exec --workspace-folder . --docker-path podman uv run mcp-standby-proxy serve -c config.yaml
 ```
+
+### Tearing down
+
+```bash
+podman rm -f $(podman ps -aq --filter label=devcontainer.local_folder=$(pwd))
+```
+
+**All project commands (`uv sync`, `uv run pytest`, etc.) must be run inside the
+DevContainer.** Do not install project dependencies or run tools on the host.
 
 ## Architecture
 
@@ -91,10 +107,14 @@ Key operational rules for implementation:
   `fix/healthcheck-timeout`.
 - **Git hooks:** `.githooks/` directory. Activate with `git config core.hooksPath .githooks`.
 
-### Docker
+### Docker / Podman
 
+- **Container engine:** Podman is the default. Use `--docker-path podman` with
+  `devcontainer` CLI. Docker works identically if preferred.
+- **DevContainer as canonical environment:** `.devcontainer/Dockerfile` defines the
+  dev image. `devcontainer.json` configures features, user, and lifecycle hooks.
 - **Multi-stage builds:** Separate dev, builder, and runtime stages.
-- **Non-root USER:** Runtime stage runs as non-root.
+- **Non-root user:** Created by `common-utils` feature (`devcontainer` user).
 - **Layer caching:** Copy `pyproject.toml` + `uv.lock` before source code.
 - **Clean up in the same layer:** Install + purge in a single `RUN`.
 
