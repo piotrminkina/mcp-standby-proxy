@@ -84,6 +84,10 @@ Key operational rules for implementation:
 - Mock MCP servers as async functions, not real processes.
 - Mock lifecycle commands with simple scripts (`true`/`false`).
 - No real Docker/systemd in tests.
+- **Smoke tests** (`tests/smoke/`, marker `@pytest.mark.smoke`): opt-in tests that run
+  against real in-process MCP servers (FastMCP + uvicorn). Not included in default
+  `pytest` run — invoke with `pytest -m smoke`. Use for transport-level integration
+  verification.
 
 ### Conventional Commits
 

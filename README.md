@@ -85,8 +85,8 @@ server:
   version: "1.0.0"
 
 backend:
-  transport: sse                  # sse | stdio (streamable_http: future)
-  url: "http://localhost:5090/sse" # Required for sse transport
+  transport: sse                  # sse | streamable_http | stdio
+  url: "http://localhost:5090/sse" # Required for sse / streamable_http
 
 lifecycle:
   start:
@@ -114,12 +114,22 @@ On first run (no cache file), the proxy starts the backend, fetches
 cache file, and serves future `tools/list` requests from cache without starting
 the backend.
 
+### Streamable HTTP transport
+
+For backends that use the newer Streamable HTTP protocol instead of SSE:
+
+```yaml
+backend:
+  transport: streamable_http
+  url: "http://localhost:5100/mcp"
+```
+
 ### Notes
 
 - `idle_timeout` and `auto_refresh` are accepted in the config but ignored in
-  the current MVP. They are reserved for post-MVP features.
-- Only `sse` transport is fully implemented in MVP. `stdio` and
-  `streamable_http` raise an error at startup.
+  the current version. They are reserved for post-MVP features.
+- `sse` and `streamable_http` transports are fully implemented. `stdio`
+  transport raises an error at startup (planned for a future release).
 
 ## CLI
 
@@ -138,7 +148,8 @@ privileges. **Review lifecycle commands before using a third-party config file.*
 
 ```bash
 uv sync                          # Install dependencies
-uv run pytest                    # Run tests
+uv run pytest                    # Run tests (unit + integration)
+uv run pytest -m smoke           # Run smoke tests (requires real server)
 uv run ruff check src/ tests/    # Lint
 ```
 
@@ -157,7 +168,7 @@ for technology choices, and [Tech Spec](docs/plans/tech-spec.md) for architectur
 
 ## Roadmap (post-MVP)
 
-- `stdio` and `streamable_http` backend transports
+- `stdio` backend transport (child process + separate infrastructure lifecycle)
 - Idle timeout: automatically stop backend after inactivity
 - Cache auto-refresh: compare live vs cached on reconnect
 - Nuitka binary builds for zero-dependency distribution

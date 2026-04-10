@@ -57,7 +57,7 @@ class BackendTransport(Protocol):
 ```
 
 **SDK integration note:** SSE and Streamable HTTP transports wrap the `mcp` SDK's
-context managers (`sse_client()`, `streamablehttp_client()`). These are entered via
+context managers (`sse_client()`, `streamable_http_client()`). These are entered via
 explicit `__aenter__()`/`__aexit__()` because the connection spans the proxy's session
 lifetime — not a single request scope.
 
