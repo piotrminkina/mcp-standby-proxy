@@ -153,6 +153,11 @@ The proxy must be configured via a YAML file with schema validation.
   features are implemented.
 - FR-5.4: Transport-specific validation: `url` required for SSE/HTTP, `command`
   required for stdio.
+- FR-5.5: Relative `cache.path` is resolved against the config file's parent
+  directory. The proxy auto-creates intermediate directories (`mkdir -p`
+  equivalent) on first cache write. The parent directory is NOT validated at
+  config load time — a typo in the path will surface as a write error when the
+  cache is actually saved.
 
 ### FR-6: State machine (MVP)
 

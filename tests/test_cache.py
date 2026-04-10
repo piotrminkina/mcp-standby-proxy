@@ -115,6 +115,17 @@ def test_load_deletes_old_version_cache(tmp_path) -> None:
     assert not cache_file.exists()
 
 
+async def test_save_raises_cache_error_when_path_component_is_file(tmp_path) -> None:
+    """mkdir fails with NotADirectoryError when a path component is a regular file."""
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("I am a file")
+
+    manager = CacheManager(blocker / "cache.json")
+
+    with pytest.raises(CacheError):
+        await manager.save(_make_cache_data())
+
+
 async def test_save_raises_cache_error_on_permission_denied(tmp_path) -> None:
     """save() raises CacheError when file cannot be written."""
     read_only_dir = tmp_path / "readonly"
@@ -128,6 +139,18 @@ async def test_save_raises_cache_error_on_permission_denied(tmp_path) -> None:
 
     # Cleanup
     read_only_dir.chmod(0o755)
+
+
+async def test_save_creates_parent_directories(tmp_path) -> None:
+    cache_file = tmp_path / "deep" / "nested" / "cache.json"
+    manager = CacheManager(cache_file)
+
+    await manager.save(_make_cache_data())
+
+    assert cache_file.exists()
+    loaded = manager.load()
+    assert loaded is not None
+    assert loaded["cache_version"] == CACHE_VERSION
 
 
 async def test_save_overwrites_existing_cache(tmp_path) -> None:

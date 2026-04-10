@@ -272,16 +272,16 @@ def test_relative_cache_path_resolved_against_config_dir(tmp_path) -> None:
     assert loaded.config.cache.path == "../cache.json"
 
 
-def test_relative_cache_path_nonexistent_parent_raises(tmp_path) -> None:
+def test_relative_cache_path_nonexistent_parent_accepted(tmp_path) -> None:
     data = _make_sse_config(tmp_path)
-    # Relative path whose resolved parent does not exist
     data["cache"]["path"] = "nonexistent_subdir/cache.json"
-    with pytest.raises(ConfigError, match="parent directory does not exist"):
-        load_config(_write_config(tmp_path, data))
+    loaded = load_config(_write_config(tmp_path, data))
+    assert loaded.resolved_cache_path == (tmp_path / "nonexistent_subdir" / "cache.json").resolve()
 
 
-def test_absolute_cache_path_nonexistent_parent_raises(tmp_path) -> None:
+def test_absolute_cache_path_nonexistent_parent_accepted(tmp_path) -> None:
     data = _make_sse_config(tmp_path)
-    data["cache"]["path"] = "/nonexistent/dir/cache.json"
-    with pytest.raises(ConfigError):
-        load_config(_write_config(tmp_path, data))
+    absent = tmp_path / "absent" / "dir"
+    data["cache"]["path"] = str(absent / "cache.json")
+    loaded = load_config(_write_config(tmp_path, data))
+    assert loaded.resolved_cache_path == (absent / "cache.json").resolve()

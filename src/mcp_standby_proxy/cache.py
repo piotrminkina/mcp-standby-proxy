@@ -60,6 +60,7 @@ def _save_sync(path: Path, data: CacheData) -> None:
     parent = path.parent
     tmp_path: Path | None = None
     try:
+        parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="w",
             dir=parent,

@@ -151,7 +151,7 @@ def load_config(path: Path) -> LoadedConfig:
 
     Resolves relative paths (e.g. cache.path) against the config file's parent
     directory. Raises ConfigError on any failure (file not found, parse error,
-    validation error, or invalid resolved paths).
+    validation error).
     """
     try:
         raw: Any = yaml.safe_load(path.read_text())
@@ -173,13 +173,6 @@ def load_config(path: Path) -> LoadedConfig:
         resolved_cache_path = raw_cache_path.resolve()
     else:
         resolved_cache_path = (config_dir / raw_cache_path).resolve()
-
-    # Unified: check resolved parent exists for all paths
-    parent = resolved_cache_path.parent
-    if not parent.exists():
-        raise ConfigError(
-            f"cache.path parent directory does not exist: {parent}"
-        )
 
     return LoadedConfig(
         config=config,
