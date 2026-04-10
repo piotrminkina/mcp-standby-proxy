@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import time
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Callable
 
 from mcp_standby_proxy.cache import CacheData, CacheManager
@@ -28,6 +30,29 @@ _CACHED_METHODS = frozenset(["tools/list", "resources/list", "prompts/list"])
 
 # MCP protocol version
 MCP_PROTOCOL_VERSION = "2024-11-05"
+
+# Default capabilities when no cache exists. Declares tool support so
+# MCP clients send tools/list, triggering cold bootstrap (FR-1.3).
+_DEFAULT_CAPABILITIES: Mapping = MappingProxyType({"tools": {}})
+
+
+def _resolve_capabilities(backend_capabilities: dict, cache_data: dict) -> dict:
+    """Derive capabilities to store in cache.
+
+    If backend returned non-empty capabilities, use them as-is.
+    Otherwise derive from method keys present in cache_data.
+    Falls back to _DEFAULT_CAPABILITIES if derivation yields nothing.
+    """
+    if backend_capabilities:
+        return backend_capabilities
+    derived: dict[str, dict] = {}
+    if "tools/list" in cache_data:
+        derived["tools"] = {}
+    if "resources/list" in cache_data:
+        derived["resources"] = {}
+    if "prompts/list" in cache_data:
+        derived["prompts"] = {}
+    return derived or dict(_DEFAULT_CAPABILITIES)
 
 
 class MessageRouter:
@@ -106,7 +131,7 @@ class MessageRouter:
         """Respond to MCP initialize with proxy server info and capabilities."""
         msg_id = message.get("id")
         cache_data = self._cache.load()
-        capabilities = cache_data.get("capabilities", {}) if cache_data else {}
+        capabilities = (cache_data.get("capabilities") or dict(_DEFAULT_CAPABILITIES)) if cache_data else dict(_DEFAULT_CAPABILITIES)
 
         response = make_response(
             id=msg_id,
@@ -158,13 +183,14 @@ class MessageRouter:
             actual_result = result.get("result", {})
             await self._writer.write_message(make_response(id=msg_id, result=actual_result))
 
-            # Save to cache asynchronously
-            new_cache = CacheData(
-                cache_version=1,
-                capabilities=cache_data.get("capabilities", {}) if cache_data else {},
-            )
+            # Reload cache to pick up capabilities derived during activation
+            cache_data = self._cache.load()
+
+            # Save to cache asynchronously — update() first, then fix capabilities
+            new_cache = CacheData(cache_version=1)
             if cache_data:
                 new_cache.update(cache_data)
+            new_cache["capabilities"] = new_cache.get("capabilities") or dict(_DEFAULT_CAPABILITIES)
             new_cache[method] = actual_result
             asyncio.create_task(self._cache.save(new_cache))
 
@@ -350,7 +376,7 @@ class MessageRouter:
             await self._bootstrap_cache(transport, backend_capabilities)
         elif not cache_data.get("capabilities"):
             # Update capabilities in existing cache without re-fetching method lists
-            cache_data["capabilities"] = backend_capabilities
+            cache_data["capabilities"] = _resolve_capabilities(backend_capabilities, cache_data)
             asyncio.create_task(self._cache.save(cache_data))
 
         await self._sm.transition(BackendState.ACTIVE)
@@ -378,6 +404,9 @@ class MessageRouter:
                     method,
                     exc,
                 )
+
+        if not cache.get("capabilities"):
+            cache["capabilities"] = _resolve_capabilities(capabilities or {}, cache)
 
         asyncio.create_task(self._cache.save(cache))
         logger.info("[%s] Cache bootstrapped", self._config.server.name)

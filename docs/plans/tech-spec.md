@@ -197,7 +197,40 @@ was started by `tools/call`, not by a cache-miss `*/list`).
 After receiving `*/list_changed`, the client sends a new `*/list` request. The proxy
 responds from the now-updated cache.
 
-## 4. Error Scenarios
+## 4. Capability Resolution
+
+MCP clients use the `capabilities` field from the `initialize` response to decide
+which methods to call. If `capabilities` is empty, the client will not send
+`tools/list` — preventing cold bootstrap (FR-1.3) from ever triggering.
+
+**Resolution logic (FR-1.1a/b/c):**
+
+```
+initialize request received
+├── cache exists?
+│   ├── yes → capabilities non-empty?
+│   │   ├── yes → use cached capabilities
+│   │   └── no  → use _DEFAULT_CAPABILITIES {"tools": {}}
+│   └── no  → use _DEFAULT_CAPABILITIES {"tools": {}}
+```
+
+**During cold bootstrap (cache write):**
+
+Some backends return empty `capabilities` in their `initialize` response (e.g.,
+Firecrawl MCP in stateless mode). When this happens, the proxy derives capabilities
+from the methods it successfully fetched:
+
+- `tools/list` fetched → `{"tools": {}}`
+- `resources/list` fetched → `{"resources": {}}`
+- `prompts/list` fetched → `{"prompts": {}}`
+
+If no methods were fetched and backend capabilities are empty, fall back to
+`_DEFAULT_CAPABILITIES`. This ensures the cache always contains usable capabilities.
+
+**Constant:** `_DEFAULT_CAPABILITIES = {"tools": {}}` — every MCP server has tools;
+this is the safe minimum to advertise.
+
+## 5. Error Scenarios
 
 Edge cases beyond the primary failure paths covered by PRD (FR-3.5, US-005):
 
@@ -218,7 +251,7 @@ Edge cases beyond the primary failure paths covered by PRD (FR-3.5, US-005):
    Cache file is NOT written (no partial cache). Backend stays running — idle timeout
    handles shutdown. Client can retry.
 
-## 5. JSON-RPC ID Mapping
+## 6. JSON-RPC ID Mapping
 
 The proxy remaps `id` fields to prevent collisions between client-originated and
 proxy-originated requests (initialize, schema refresh):

@@ -66,7 +66,13 @@ response body as returned by the real backend.
 
 **Sub-requirements:**
 - FR-1.1: On `initialize` request, proxy responds with its own server info and
-  capabilities derived from the cache (if cache exists).
+  capabilities. Capability resolution order:
+  - FR-1.1a: Cache exists with non-empty `capabilities` → use cached capabilities.
+  - FR-1.1b: Cache missing OR `capabilities` is empty → declare default capabilities
+    (`{"tools": {}}`) so MCP clients send `tools/list`, enabling cold bootstrap.
+  - FR-1.1c: During cold bootstrap, if the backend's `initialize` response has empty
+    capabilities, derive them from the methods successfully fetched (`tools/list`
+    present → `{"tools": {}}`, etc.). Store derived capabilities in the cache.
 - FR-1.2: On `tools/list` request with cache present, proxy returns cached response.
 - FR-1.3: On `tools/list` request with no cache, proxy starts the backend, fetches
   the tool list from the live backend, returns the response to the client immediately,

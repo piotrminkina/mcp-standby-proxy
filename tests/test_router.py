@@ -1,3 +1,4 @@
+import asyncio
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -150,12 +151,25 @@ async def test_initialize_returns_server_info_from_cache(tmp_path) -> None:
     assert result["capabilities"] == {"tools": {"listChanged": True}}
 
 
-async def test_initialize_without_cache_returns_minimal_capabilities(tmp_path) -> None:
+async def test_initialize_without_cache_returns_default_capabilities(tmp_path) -> None:
+    """No cache: initialize must declare tools capability for cold bootstrap."""
     router, messages, _, _ = await _make_router(tmp_path)
     await router.handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
 
     result = messages[0]["result"]
-    assert result["capabilities"] == {}
+    assert "tools" in result["capabilities"], (
+        "Without cache, proxy must declare tools capability so client sends tools/list"
+    )
+
+
+async def test_initialize_with_cache_missing_capabilities_uses_default(tmp_path) -> None:
+    """Cache exists but has no capabilities key — use default."""
+    cache_data = CacheData(cache_version=1)
+    router, messages, _, _ = await _make_router(tmp_path, cache_data=cache_data)
+    await router.handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+
+    result = messages[0]["result"]
+    assert "tools" in result["capabilities"]
 
 
 # ---- ping ----
@@ -341,3 +355,150 @@ async def test_notification_when_cold_dropped(tmp_path) -> None:
 
     assert "notifications/something" not in transport.notifications_sent
     assert len(messages) == 0  # No response for notifications
+
+
+# ---- cached capabilities bugs ----
+
+async def test_initialize_with_cache_empty_capabilities_uses_default(tmp_path) -> None:
+    """Bug 1: cache has capabilities={} — must fall back to _DEFAULT_CAPABILITIES."""
+    cache_data = CacheData(
+        cache_version=1,
+        capabilities={},
+        **{"tools/list": {"tools": [{"name": "some-tool"}]}},
+    )
+    router, messages, _, _ = await _make_router(tmp_path, cache_data=cache_data)
+    await router.handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+
+    result = messages[0]["result"]
+    assert "tools" in result["capabilities"], (
+        "Empty capabilities in cache must fall back to default so client sends tools/list"
+    )
+
+
+async def test_bootstrap_cache_derives_capabilities_from_fetched_methods(tmp_path) -> None:
+    """Bug 2: when backend returns empty capabilities but tools/list succeeds,
+    cache must derive capabilities from the fetched methods."""
+    transport = _MockTransport(
+        responses={
+            "initialize": {"capabilities": {}},
+            "tools/list": {"tools": [{"name": "my-tool"}]},
+        }
+    )
+    router, messages, mock_transport, sm = await _make_router(tmp_path, transport=transport)
+
+    # Trigger backend start via tools/call
+    await router.handle_message({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {"name": "my-tool", "arguments": {}},
+    })
+
+    assert sm.state == BackendState.ACTIVE
+
+    # Allow background cache save task (create_task + run_in_executor) to complete
+    await asyncio.sleep(0.05)
+
+    cache = router._cache.load()
+    assert cache is not None
+    assert "tools" in cache.get("capabilities", {}), (
+        "Bootstrapped cache must derive tools capability from fetched tools/list"
+    )
+
+
+async def test_bootstrap_cache_with_explicit_capabilities_preserves_them(tmp_path) -> None:
+    """Backend returns explicit capabilities — must NOT be overwritten by derivation."""
+    transport = _MockTransport(
+        responses={
+            "initialize": {"capabilities": {"tools": {"listChanged": True}}},
+            "tools/list": {"tools": []},
+        }
+    )
+    router, messages, mock_transport, sm = await _make_router(tmp_path, transport=transport)
+
+    await router.handle_message({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {"name": "t", "arguments": {}},
+    })
+
+    assert sm.state == BackendState.ACTIVE
+
+    # Allow background cache save task (create_task + run_in_executor) to complete
+    await asyncio.sleep(0.05)
+
+    cache = router._cache.load()
+    assert cache is not None
+    assert cache.get("capabilities") == {"tools": {"listChanged": True}}, (
+        "Explicit backend capabilities must be preserved verbatim"
+    )
+
+
+async def test_warm_cache_empty_capabilities_derives_from_methods(tmp_path) -> None:
+    """Warm-cache path: cache exists with empty capabilities but has method data.
+    Backend also returns empty capabilities — must derive from method keys, not write {}."""
+    cache_data = CacheData(
+        cache_version=1,
+        capabilities={},
+        **{"tools/list": {"tools": [{"name": "t"}]}},
+    )
+    transport = _MockTransport(
+        responses={
+            "initialize": {"capabilities": {}},
+        }
+    )
+    router, messages, mock_transport, sm = await _make_router(
+        tmp_path, transport=transport, cache_data=cache_data
+    )
+
+    await router.handle_message({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {"name": "t", "arguments": {}},
+    })
+
+    assert sm.state == BackendState.ACTIVE
+
+    # Allow background cache save task to complete
+    await asyncio.sleep(0.05)
+
+    cache = router._cache.load()
+    assert cache is not None
+    assert cache.get("capabilities") == {"tools": {}}, (
+        "Warm-cache path must derive tools capability from tools/list key, not write {}"
+    )
+
+
+async def test_bootstrap_cache_derives_multiple_capabilities(tmp_path) -> None:
+    """Backend returns empty capabilities but all three methods succeed —
+    cache must derive all three capability keys."""
+    transport = _MockTransport(
+        responses={
+            "initialize": {"capabilities": {}},
+            "tools/list": {"tools": []},
+            "resources/list": {"resources": []},
+            "prompts/list": {"prompts": []},
+        }
+    )
+    router, messages, mock_transport, sm = await _make_router(tmp_path, transport=transport)
+
+    await router.handle_message({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {"name": "t", "arguments": {}},
+    })
+
+    assert sm.state == BackendState.ACTIVE
+
+    # Allow background cache save task (create_task + run_in_executor) to complete
+    await asyncio.sleep(0.05)
+
+    cache = router._cache.load()
+    assert cache is not None
+    caps = cache.get("capabilities", {})
+    assert "tools" in caps
+    assert "resources" in caps
+    assert "prompts" in caps
