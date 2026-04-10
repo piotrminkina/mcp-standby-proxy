@@ -32,13 +32,14 @@ def test_concrete_class_satisfies_protocol() -> None:
     assert transport.is_connected() is False
 
 
-def test_create_transport_streamable_http_raises_config_error() -> None:
+def test_create_transport_streamable_http_returns_streamable_http_transport() -> None:
     config = BackendConfig(
         transport=BackendTransportEnum.STREAMABLE_HTTP,
-        url="http://localhost:8080",
+        url="http://localhost:8080/mcp",
     )
-    with pytest.raises(ConfigError, match="not implemented"):
-        create_transport(config)
+    from mcp_standby_proxy.transport.streamable_http import StreamableHttpTransport
+    transport = create_transport(config)
+    assert isinstance(transport, StreamableHttpTransport)
 
 
 def test_create_transport_stdio_raises_config_error() -> None:

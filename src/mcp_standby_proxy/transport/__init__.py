@@ -8,14 +8,19 @@ __all__ = ["BackendTransport", "create_transport"]
 def create_transport(config: BackendConfig) -> BackendTransport:
     """Create transport based on config.backend.transport.
 
-    Only SSE is supported in MVP. Raises ConfigError for unsupported transports.
+    SSE and Streamable HTTP are supported. Raises ConfigError for unsupported transports.
     """
     if config.transport == BackendTransportEnum.SSE:
         from mcp_standby_proxy.transport.sse import SseTransport
         assert config.url is not None
         return SseTransport(config.url)
 
+    if config.transport == BackendTransportEnum.STREAMABLE_HTTP:
+        from mcp_standby_proxy.transport.streamable_http import StreamableHttpTransport
+        assert config.url is not None
+        return StreamableHttpTransport(config.url)
+
     raise ConfigError(
-        f"Transport '{config.transport.value}' is not implemented in MVP. "
-        "Only 'sse' transport is supported."
+        f"Transport '{config.transport.value}' is not implemented. "
+        "Only 'sse' and 'streamable_http' transports are supported."
     )
