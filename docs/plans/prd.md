@@ -202,6 +202,51 @@ Support for stdio-based MCP backends with separate infrastructure lifecycle.
 - FR-10.4: Extend to `resources/list`, `prompts/list` if backend declares those
   capabilities.
 
+### FR-17: Client capability forwarding (post-MVP phase 1)
+
+The proxy must forward client capabilities to the backend so the backend knows
+what the client supports.
+
+**Context:** MCP clients (e.g., Claude Code) declare capabilities in their
+`initialize` request (`roots`, `sampling`, `elicitation`). Backends use these to
+decide which server-to-client requests to send (e.g., `roots/list` if the client
+declared `roots`). Currently the proxy sends `"capabilities": {}` to the backend,
+causing backends to log warnings and skip features that require client support.
+
+- FR-17.1: On `initialize` from the client, store `params.capabilities` and
+  `params.clientInfo` on the router for later use.
+- FR-17.2: When connecting to the backend (`_connect_backend` / `_do_start`),
+  forward the stored client capabilities in the `initialize` request to the
+  backend. If no client has initialized yet (cold bootstrap triggered by cache
+  miss), use `"capabilities": {}` as fallback.
+- FR-17.3: Forward `clientInfo` from the real client, optionally augmented with
+  proxy metadata (e.g., `"name": "mcp-standby-proxy (Claude Code)"`).
+
+### FR-18: Server-to-client request forwarding (post-MVP)
+
+The proxy must support bidirectional message forwarding: backend-initiated
+requests relayed to the client, client responses relayed back to the backend.
+
+**Context:** MCP backends can send requests to the client (e.g., `roots/list`,
+`sampling/createMessage`). This requires a persistent read loop on the backend
+transport that listens for incoming messages beyond request-response pairs.
+Currently the proxy's `BackendTransport.request()` discards any message whose
+`id` doesn't match the pending request — server-to-client requests are silently
+lost.
+
+- FR-18.1: Add a background reader task on the backend transport that receives
+  all incoming messages (responses, requests, notifications).
+- FR-18.2: Incoming backend responses are routed to pending `request()` calls
+  (existing behavior, refactored from inline read loop).
+- FR-18.3: Incoming backend requests (messages with `method` and `id` but
+  originated by the server) are forwarded to the client via stdout with
+  proxy-remapped IDs.
+- FR-18.4: Client responses to server-originated requests are forwarded back
+  to the backend via the transport.
+- FR-18.5: Incoming backend notifications are forwarded to the client via stdout.
+- FR-18.6: ID remapping must prevent collisions between client-originated IDs,
+  proxy-originated IDs, and server-originated IDs.
+
 ### FR-11: Standalone binary build (post-MVP)
 
 - FR-11.1: Build pipeline that compiles the proxy to a standalone native binary.
@@ -258,6 +303,7 @@ Prerequisite: spike to verify MCP client displays `notifications/message`. Drop 
 
 Quality-of-life improvements. Build after MVP is proven in real sessions.
 
+- Client capability forwarding — FR-17
 - Cache pre-warm CLI (`warm` subcommand) — FR-13
 - Startup cleanup / orphan backend detection — FR-15
 - Cache age warning — FR-16
@@ -270,6 +316,7 @@ Quality-of-life improvements. Build after MVP is proven in real sessions.
 - Idle timeout with auto-shutdown
 - Background schema refresh + `notifications/*/list_changed`
 - Generic capability caching (`resources/list`, `prompts/list`)
+- Server-to-client request forwarding (bidirectional proxy) — FR-18
 - Standalone binary distribution
 - `validate` CLI subcommand
 
@@ -500,6 +547,39 @@ Acceptance criteria:
 
 ---
 
+**US-018: Client capabilities forwarded to backend**
+
+As a developer using an MCP backend that supports server-to-client features
+(e.g., `roots/list`, `sampling/createMessage`), I want the proxy to forward my
+MCP client's capabilities to the backend so that the backend knows what features
+are available and doesn't log warnings about missing capabilities.
+
+Acceptance criteria:
+- MCP client sends `initialize` with `capabilities: {roots: {listChanged: true}}`.
+- Proxy stores client capabilities.
+- When proxy connects to backend, `initialize` includes the stored client capabilities.
+- Backend does not log "could not infer client capabilities" warnings.
+- If backend is started before any client initializes (cold bootstrap), proxy sends
+  `"capabilities": {}` as fallback (no regression).
+
+---
+
+**US-019: Server-to-client request forwarding**
+
+As a developer using an MCP backend that needs to query the client (e.g.,
+`roots/list` to discover workspace roots), I want the proxy to relay these
+requests to my MCP client and return the client's response to the backend.
+
+Acceptance criteria:
+- Backend sends `roots/list` request to proxy.
+- Proxy forwards request to MCP client via stdout (with remapped ID).
+- MCP client responds on stdin.
+- Proxy relays response back to the backend.
+- Round-trip latency < 100ms proxy overhead.
+- Server-originated notifications from backend are forwarded to client.
+
+---
+
 **US-017: Config validation CLI**
 
 As a developer creating a new config, I want to validate it before running the proxy.
@@ -534,6 +614,8 @@ Acceptance criteria:
 | MCP client timeouts on `tools/list` during cold bootstrap | High | High (first run) | FR-13 warm CLI pre-builds cache. FR-14 progress notifications keep connection alive. Document client-side timeout configuration. |
 | Proxy receives SIGKILL (client crash) — backend left running | Medium | Medium | FR-15 startup cleanup detects and reuses orphan backends. Idle timeout (post-MVP) limits orphan lifetime. |
 | Cache format incompatibility after proxy upgrade | Low | Low | FR-1.5 cache versioning. Invalid cache is deleted and rebuilt via cold bootstrap. |
+| Backend features degraded due to missing client capabilities | Medium | High | Proxy sends empty capabilities, backend cannot use `roots/list`, `sampling/createMessage`. FR-17 fixes this. FR-18 adds full bidirectional support. |
+| Server-to-client requests silently dropped | Medium | Medium | Transport read loop only matches response IDs, discards server-initiated messages. FR-18 introduces background reader task and forwarding. |
 
 ## 8. Technical Constraints
 
