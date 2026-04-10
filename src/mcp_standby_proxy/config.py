@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -119,16 +120,6 @@ class CacheConfig(BaseModel):
     path: str
     auto_refresh: bool = True
 
-    @field_validator("path")
-    @classmethod
-    def validate_parent_exists(cls, v: str) -> str:
-        parent = Path(v).parent
-        if not parent.exists():
-            raise ValueError(
-                f"cache.path parent directory does not exist: {parent}"
-            )
-        return v
-
 
 class ProxyConfig(BaseModel):
     version: int
@@ -145,10 +136,22 @@ class ProxyConfig(BaseModel):
         return v
 
 
-def load_config(path: Path) -> ProxyConfig:
+@dataclass(frozen=True)
+class LoadedConfig:
+    """Result of loading a config file. Bundles the parsed config with
+    path-resolution context derived from the config file's location."""
+
+    config: ProxyConfig
+    config_dir: Path
+    resolved_cache_path: Path
+
+
+def load_config(path: Path) -> LoadedConfig:
     """Load and validate proxy configuration from a YAML file.
 
-    Raises ConfigError on any failure (file not found, parse error, validation error).
+    Resolves relative paths (e.g. cache.path) against the config file's parent
+    directory. Raises ConfigError on any failure (file not found, parse error,
+    validation error, or invalid resolved paths).
     """
     try:
         raw: Any = yaml.safe_load(path.read_text())
@@ -158,6 +161,28 @@ def load_config(path: Path) -> ProxyConfig:
         raise ConfigError(f"Failed to parse YAML config: {exc}") from exc
 
     try:
-        return ProxyConfig.model_validate(raw)
+        config = ProxyConfig.model_validate(raw)
     except Exception as exc:
         raise ConfigError(f"Invalid configuration: {exc}") from exc
+
+    config_dir = path.resolve().parent
+
+    # Resolve cache.path: relative paths resolve against config_dir.
+    raw_cache_path = Path(config.cache.path)
+    if raw_cache_path.is_absolute():
+        resolved_cache_path = raw_cache_path.resolve()
+    else:
+        resolved_cache_path = (config_dir / raw_cache_path).resolve()
+
+    # Unified: check resolved parent exists for all paths
+    parent = resolved_cache_path.parent
+    if not parent.exists():
+        raise ConfigError(
+            f"cache.path parent directory does not exist: {parent}"
+        )
+
+    return LoadedConfig(
+        config=config,
+        config_dir=config_dir,
+        resolved_cache_path=resolved_cache_path,
+    )

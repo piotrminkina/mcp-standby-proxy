@@ -1,10 +1,9 @@
 import asyncio
 import logging
 import sys
-from pathlib import Path
 
 from mcp_standby_proxy.cache import CacheManager
-from mcp_standby_proxy.config import ProxyConfig
+from mcp_standby_proxy.config import LoadedConfig
 from mcp_standby_proxy.jsonrpc import JsonRpcReader, JsonRpcWriter
 from mcp_standby_proxy.lifecycle import LifecycleManager
 from mcp_standby_proxy.router import MessageRouter
@@ -47,8 +46,10 @@ def _setup_logging(server_name: str, verbose: int = 0) -> None:
 class ProxyRunner:
     """Wires all components together and runs the proxy event loop."""
 
-    def __init__(self, config: ProxyConfig, verbose: int = 0) -> None:
-        self._config = config
+    def __init__(self, loaded: LoadedConfig, verbose: int = 0) -> None:
+        self._config = loaded.config
+        self._config_dir = loaded.config_dir
+        self._resolved_cache_path = loaded.resolved_cache_path
         self._verbose = verbose
         self._shutdown_event = asyncio.Event()
         self._tasks: set[asyncio.Task] = set()
@@ -64,8 +65,13 @@ class ProxyRunner:
         # Wire components
         sm = StateMachine()
         self._sm = sm
-        cache_manager = CacheManager(Path(self._config.cache.path))
-        lifecycle_manager = LifecycleManager(self._config.lifecycle, sm, self._config.server.name)
+        cache_manager = CacheManager(self._resolved_cache_path)
+        lifecycle_manager = LifecycleManager(
+            self._config.lifecycle,
+            sm,
+            self._config.server.name,
+            cwd=self._config_dir,
+        )
         writer = JsonRpcWriter(sys.stdout.buffer)
 
         def _transport_factory():

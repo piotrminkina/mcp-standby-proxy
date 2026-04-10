@@ -28,6 +28,6 @@ def main() -> None:
 )
 def serve(config: str, verbose: int) -> None:
     """Start the proxy in stdio mode."""
-    cfg = load_config(Path(config))
-    runner = ProxyRunner(cfg, verbose=verbose)
+    loaded = load_config(Path(config))
+    runner = ProxyRunner(loaded, verbose=verbose)
     asyncio.run(runner.run())

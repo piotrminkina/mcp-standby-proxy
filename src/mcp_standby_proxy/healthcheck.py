@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from pathlib import Path
 
 import httpx
 
@@ -41,13 +42,14 @@ async def _check_tcp(address: str, timeout: float) -> bool:
         return False
 
 
-async def _check_command(command: str, timeout: float) -> bool:
+async def _check_command(command: str, timeout: float, cwd: Path | None = None) -> bool:
     """Return True if the shell command exits with code 0 within timeout."""
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            cwd=cwd,
         )
         try:
             return_code = await asyncio.wait_for(proc.wait(), timeout=timeout)
@@ -60,7 +62,11 @@ async def _check_command(command: str, timeout: float) -> bool:
         return False
 
 
-async def run_healthcheck(config: HealthcheckConfig, server_name: str) -> None:
+async def run_healthcheck(
+    config: HealthcheckConfig,
+    server_name: str,
+    cwd: Path | None = None,
+) -> None:
     """Poll healthcheck until success or max_attempts exceeded.
 
     Raises HealthcheckError if max attempts exceeded.
@@ -86,7 +92,7 @@ async def run_healthcheck(config: HealthcheckConfig, server_name: str) -> None:
                 success = await _check_tcp(config.address, float(config.timeout))
             elif config.type == HealthcheckType.COMMAND:
                 assert config.command is not None
-                success = await _check_command(config.command, float(config.timeout))
+                success = await _check_command(config.command, float(config.timeout), cwd=cwd)
         except Exception as exc:
             last_error = str(exc)
             success = False

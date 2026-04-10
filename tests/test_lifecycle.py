@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -41,9 +42,17 @@ def _make_lifecycle_config(
     )
 
 
-def _make_manager(config: LifecycleConfig) -> tuple[LifecycleManager, StateMachine]:
+def _make_manager(
+    config: LifecycleConfig,
+    config_dir: Path | None = None,
+) -> tuple[LifecycleManager, StateMachine]:
     sm = StateMachine()
-    mgr = LifecycleManager(config, sm, "test-server")
+    mgr = LifecycleManager(
+        config,
+        sm,
+        "test-server",
+        cwd=config_dir or Path("/tmp"),
+    )
     return mgr, sm
 
 
@@ -154,3 +163,61 @@ async def test_stop_passes_correct_args_to_command() -> None:
             await mgr.stop()
 
     assert calls[0] == ("echo", ["stop", "called"])
+
+
+async def test_start_command_runs_with_config_dir_as_cwd(tmp_path) -> None:
+    """start() must pass config_dir as cwd to create_subprocess_exec."""
+    captured_kwargs: list[dict] = []
+
+    original_exec = asyncio.create_subprocess_exec
+
+    async def _mock_exec(cmd, *args, **kwargs):
+        captured_kwargs.append(kwargs)
+        return await original_exec(cmd, *args, **kwargs)
+
+    config = _make_lifecycle_config()
+    mgr, sm = _make_manager(config, config_dir=tmp_path)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=_mock_exec):
+        async with sm.lock:
+            await mgr.start()
+
+    assert captured_kwargs, "create_subprocess_exec was not called"
+    assert captured_kwargs[0].get("cwd") == tmp_path
+
+
+async def test_start_passes_config_dir_to_healthcheck(tmp_path) -> None:
+    """LifecycleManager.start() forwards config_dir to run_healthcheck."""
+    config = _make_lifecycle_config(healthcheck_type="command", healthcheck_command="true")
+    mgr, sm = _make_manager(config, config_dir=tmp_path)
+
+    mock_hc = AsyncMock(return_value=None)
+    with patch("mcp_standby_proxy.lifecycle.run_healthcheck", mock_hc):
+        async with sm.lock:
+            await mgr.start()
+
+    mock_hc.assert_called_once()
+    _, kwargs = mock_hc.call_args
+    assert kwargs.get("cwd") == tmp_path
+
+
+async def test_stop_command_runs_with_config_dir_as_cwd(tmp_path) -> None:
+    """stop() must pass config_dir as cwd to create_subprocess_exec."""
+    captured_kwargs: list[dict] = []
+
+    original_exec = asyncio.create_subprocess_exec
+
+    async def _mock_exec(cmd, *args, **kwargs):
+        captured_kwargs.append(kwargs)
+        return await original_exec(cmd, *args, **kwargs)
+
+    config = _make_lifecycle_config()
+    mgr, sm = _make_manager(config, config_dir=tmp_path)
+    sm._state = BackendState.ACTIVE
+
+    with patch("asyncio.create_subprocess_exec", side_effect=_mock_exec):
+        async with sm.lock:
+            await mgr.stop()
+
+    assert captured_kwargs, "create_subprocess_exec was not called"
+    assert captured_kwargs[0].get("cwd") == tmp_path

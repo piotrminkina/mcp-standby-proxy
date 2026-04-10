@@ -4,8 +4,6 @@ Uses a MockTransport instead of a real SSE server, but all other components
 (StateMachine, CacheManager, LifecycleManager mock, MessageRouter) are real.
 """
 import asyncio
-from pathlib import Path
-
 
 from mcp_standby_proxy.cache import CacheData, CacheManager
 from mcp_standby_proxy.state import BackendState
@@ -67,7 +65,7 @@ async def test_full_cold_start_flow(tmp_path) -> None:
 async def test_cold_cache_bootstrap(tmp_path) -> None:
     """US-003: No cache file; tools/list triggers backend start, tools fetched and cached."""
     router, writer, transport, sm = make_router(tmp_path)
-    cache_file = Path(router._config.cache.path)
+    cache_file = router._cache._path
     assert not cache_file.exists()
 
     await router.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})

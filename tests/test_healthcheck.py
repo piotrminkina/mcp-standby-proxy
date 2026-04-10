@@ -138,6 +138,22 @@ async def test_http_per_attempt_timeout_retries_on_recovery() -> None:
     assert call_count == 3
 
 
+async def test_command_healthcheck_runs_with_config_dir_as_cwd(tmp_path) -> None:
+    """Command-type healthcheck passes config_dir as cwd to subprocess."""
+    config = _command_config(command="true")
+
+    with patch("asyncio.create_subprocess_shell") as mock_shell:
+        mock_proc = AsyncMock()
+        mock_proc.wait = AsyncMock(return_value=0)
+        mock_shell.return_value = mock_proc
+
+        await run_healthcheck(config, "test", cwd=tmp_path)
+
+    mock_shell.assert_called_once()
+    _, kwargs = mock_shell.call_args
+    assert kwargs.get("cwd") == tmp_path
+
+
 async def test_healthcheck_logs_attempts(caplog) -> None:
     fail_response = MagicMock(is_success=False)
     ok_response = MagicMock(is_success=True)

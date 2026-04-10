@@ -61,10 +61,10 @@ class _MockTransport:
 
 
 def _make_router_and_deps(tmp_path):
-    config = _make_config(tmp_path)
+    loaded = _make_config(tmp_path)
     sm = StateMachine()
     writer = _CollectingWriter()
-    cache_manager = CacheManager(Path(config.cache.path))
+    cache_manager = CacheManager(loaded.resolved_cache_path)
     mock_transport = _MockTransport()
     mock_lifecycle = MagicMock(spec=LifecycleManager)
 
@@ -76,7 +76,7 @@ def _make_router_and_deps(tmp_path):
     mock_lifecycle.stop = AsyncMock()
 
     router = MessageRouter(
-        config=config,
+        config=loaded.config,
         state_machine=sm,
         lifecycle_manager=mock_lifecycle,
         cache_manager=cache_manager,
@@ -132,8 +132,8 @@ async def test_proxy_runner_shuts_down_on_stdin_eof(tmp_path) -> None:
     """ProxyRunner should stop when stdin sends EOF."""
     from mcp_standby_proxy.proxy import ProxyRunner
 
-    config = _make_config(tmp_path)
-    runner = ProxyRunner(config)
+    loaded = _make_config(tmp_path)
+    runner = ProxyRunner(loaded)
     runner._shutdown_event = asyncio.Event()
 
     # We'll test that the shutdown event is set when triggered
@@ -146,8 +146,8 @@ async def test_proxy_runner_shutdown_event_can_be_set(tmp_path) -> None:
     """Verify shutdown event mechanism works."""
     from mcp_standby_proxy.proxy import ProxyRunner
 
-    config = _make_config(tmp_path)
-    runner = ProxyRunner(config)
+    loaded = _make_config(tmp_path)
+    runner = ProxyRunner(loaded)
     runner._shutdown_event = asyncio.Event()
 
     assert not runner._shutdown_event.is_set()

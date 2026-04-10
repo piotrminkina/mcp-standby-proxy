@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from pathlib import Path
 
 from mcp_standby_proxy.config import LifecycleConfig
 from mcp_standby_proxy.errors import HealthcheckError, StartError
@@ -15,6 +16,7 @@ async def _run_command(
     timeout: int,
     server_name: str,
     label: str,
+    cwd: Path | None = None,
 ) -> tuple[int | None, str]:
     """Run command + args, wait up to timeout seconds.
 
@@ -26,6 +28,7 @@ async def _run_command(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
     )
     try:
         stdout, stderr = await asyncio.wait_for(
@@ -53,10 +56,12 @@ class LifecycleManager:
         config: LifecycleConfig,
         state_machine: StateMachine,
         server_name: str,
+        cwd: Path,
     ) -> None:
         self._config = config
         self._sm = state_machine
         self._server_name = server_name
+        self._cwd = cwd
 
     async def start(self) -> None:
         """Execute start command and poll healthcheck.
@@ -75,6 +80,7 @@ class LifecycleManager:
             start_cfg.timeout,
             self._server_name,
             "start",
+            cwd=self._cwd,
         )
 
         if exit_code != 0:
@@ -84,7 +90,7 @@ class LifecycleManager:
         logger.debug("[%s] Start command succeeded, polling healthcheck", self._server_name)
 
         try:
-            await run_healthcheck(self._config.healthcheck, self._server_name)
+            await run_healthcheck(self._config.healthcheck, self._server_name, cwd=self._cwd)
         except HealthcheckError:
             await self._sm.transition(BackendState.FAILED)
             raise
@@ -109,6 +115,7 @@ class LifecycleManager:
             stop_cfg.timeout,
             self._server_name,
             "stop",
+            cwd=self._cwd,
         )
 
         if exit_code != 0:

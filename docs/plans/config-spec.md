@@ -15,6 +15,20 @@
 **Sensitive data:** Plain text in config. For secrets, set env vars on the proxy process
 directly — the proxy does not interpolate `${VAR}` in config values.
 
+### Path Resolution
+
+All relative file paths in the configuration are resolved against the **config file's
+parent directory** (`config_dir`). This applies to:
+
+- `cache.path` — resolved to `config_dir / cache.path` if not absolute.
+- `lifecycle.start` / `lifecycle.stop` — subprocess is spawned with `cwd=config_dir`.
+
+This rule ensures that a config file is self-contained and portable: moving the config
+file together with its sibling files (cache, docker-compose.yml, etc.) preserves correct
+path resolution regardless of the proxy process's working directory.
+
+Absolute paths are used as-is, without modification.
+
 ## 2. Configuration Schema
 
 ```yaml
@@ -114,16 +128,16 @@ cache:
 
 | Parameter | Type | Default | Required | Validation |
 |-----------|------|---------|----------|------------|
-| `lifecycle.start.command` | string | — | yes | Non-empty. Must be executable. |
-| `lifecycle.start.args` | list[string] | `[]` | no | — |
+| `lifecycle.start.command` | string | — | yes | Non-empty. Must be executable. Subprocess runs with `cwd=config_dir`. Executed via `exec` (no shell interpretation — pipes, redirects, and globbing are not available). |
+| `lifecycle.start.args` | list[string] | `[]` | no | Relative paths in args resolve against `config_dir` (subprocess CWD). |
 | `lifecycle.start.timeout` | int | `30` | no | Seconds. Range: 1–600. |
-| `lifecycle.stop.command` | string | — | yes | Non-empty. Must be executable. |
-| `lifecycle.stop.args` | list[string] | `[]` | no | — |
+| `lifecycle.stop.command` | string | — | yes | Non-empty. Must be executable. Subprocess runs with `cwd=config_dir`. Executed via `exec` (no shell interpretation — pipes, redirects, and globbing are not available). |
+| `lifecycle.stop.args` | list[string] | `[]` | no | Relative paths in args resolve against `config_dir` (subprocess CWD). |
 | `lifecycle.stop.timeout` | int | `30` | no | Seconds. Range: 1–600. |
 | `lifecycle.healthcheck.type` | enum | — | yes | One of: `http`, `tcp`, `command`. |
 | `lifecycle.healthcheck.url` | string | — | conditional | Required if type is `http`. Must be valid URL. |
 | `lifecycle.healthcheck.address` | string | — | conditional | Required if type is `tcp`. Format: `host:port`. |
-| `lifecycle.healthcheck.command` | string | — | conditional | Required if type is `command`. Non-empty. |
+| `lifecycle.healthcheck.command` | string | — | conditional | Required if type is `command`. Non-empty. Executed via `/bin/sh -c` (shell interpretation — pipes, redirects, `&&` etc. are available). |
 | `lifecycle.healthcheck.interval` | int | `2` | no | Seconds between polls. Range: 1–60. |
 | `lifecycle.healthcheck.max_attempts` | int | `30` | no | Range: 1–600. |
 | `lifecycle.healthcheck.timeout` | int | `5` | no | Seconds per attempt. Range: 1–60. |
@@ -133,7 +147,7 @@ cache:
 
 | Parameter | Type | Default | Required | Validation |
 |-----------|------|---------|----------|------------|
-| `cache.path` | string | — | yes | File path. Parent directory must exist. |
+| `cache.path` | string | — | yes | File path (absolute or relative to config file). Parent directory must exist after resolution. |
 | `cache.auto_refresh` | bool | `true` | no | Ignored in MVP. |
 
 ## 4. Validation Rules
@@ -150,8 +164,9 @@ Cross-field constraints enforced at config load time (fail-fast):
 4. **Start command idempotency:** Not validated by the proxy. Document in error
    messages: "Ensure your start command is idempotent (running it when already
    started is a no-op)." (FR-2.6)
-5. **Cache path parent:** `cache.path` parent directory must exist at config
-   load time. The cache file itself may not exist (cold bootstrap).
+5. **Cache path parent:** `cache.path` is resolved against `config_dir` if relative.
+   The resolved path's parent directory must exist at config load time. The cache file
+   itself may not exist (cold bootstrap).
 
 ## 5. Configuration Variants
 
@@ -219,6 +234,10 @@ cache:
 
 ### C. Streamable HTTP backend (web scraper)
 
+Place this config file alongside the project's `docker-compose.yml`. Lifecycle
+commands run with `cwd=config_dir`, so `docker compose` finds its compose file
+automatically — no absolute paths needed.
+
 ```yaml
 version: 1
 server:
@@ -229,21 +248,22 @@ backend:
   url: "http://localhost:5100/mcp"
 lifecycle:
   start:
-    command: "bash"
-    args: ["-c", "cd /path/to/firecrawl && docker compose up -d"]
+    command: "docker"
+    args: ["compose", "up", "-d"]
     timeout: 60
   stop:
-    command: "bash"
-    args: ["-c", "cd /path/to/firecrawl && docker compose down"]
+    command: "docker"
+    args: ["compose", "stop"]
     timeout: 30
   healthcheck:
     type: http
-    url: "http://localhost:5100/mcp"
-    interval: 2
-    max_attempts: 30
+    url: "http://localhost:5100/health"
+    interval: 3
+    max_attempts: 60
+    timeout: 5
   idle_timeout: 300
 cache:
-  path: "./firecrawl_cache.json"
+  path: ".cache/firecrawl-mcp.json"
   auto_refresh: true
 ```
 

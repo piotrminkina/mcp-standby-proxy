@@ -148,7 +148,7 @@ activate P #3a4a5c
 
 note right of P: cache miss → Cold → Starting
 
-P -> B: exec start command
+P -> B: exec start command (cwd=config_dir)
 P -> B: healthcheck poll (loop)
 B --> P: healthcheck pass
 

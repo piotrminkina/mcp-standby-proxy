@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 from mcp_standby_proxy.cache import CacheData, CacheManager
-from mcp_standby_proxy.config import load_config, ProxyConfig
+from mcp_standby_proxy.config import load_config, LoadedConfig
 from mcp_standby_proxy.jsonrpc import JsonRpcWriter
 from mcp_standby_proxy.lifecycle import LifecycleManager
 from mcp_standby_proxy.router import MessageRouter
@@ -76,7 +76,7 @@ class MockTransport:
         return self._connected
 
 
-def make_config(tmp_path: Path) -> ProxyConfig:
+def make_config(tmp_path: Path) -> LoadedConfig:
     config_file = tmp_path / "config.yaml"
     config_file.write_text(yaml.dump({
         "version": 1,
@@ -98,11 +98,12 @@ def make_router(
     cache_data: CacheData | None = None,
     start_fails: bool = False,
 ) -> tuple[MessageRouter, CollectingWriter, MockTransport, StateMachine]:
-    config = make_config(tmp_path)
+    loaded = make_config(tmp_path)
+    config = loaded.config
     sm = StateMachine()
     writer = CollectingWriter()
     mock_transport = transport or MockTransport()
-    cache_manager = CacheManager(Path(config.cache.path))
+    cache_manager = CacheManager(loaded.resolved_cache_path)
 
     mock_lifecycle = MagicMock(spec=LifecycleManager)
 
@@ -135,7 +136,7 @@ def make_router(
 
 
 @pytest.fixture
-def sample_config(tmp_path) -> ProxyConfig:
+def sample_config(tmp_path) -> LoadedConfig:
     return make_config(tmp_path)
 
 
