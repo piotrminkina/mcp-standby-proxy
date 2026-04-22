@@ -1,8 +1,6 @@
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from mcp_standby_proxy.config import BackendConfig, BackendTransport as BackendTransportEnum
 from mcp_standby_proxy.transport import BackendTransport, create_transport
 

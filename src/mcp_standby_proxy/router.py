@@ -3,7 +3,7 @@ import logging
 import time
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Callable
+from typing import Any, Callable
 
 from mcp_standby_proxy.cache import CacheData, CacheManager
 from mcp_standby_proxy.config import ProxyConfig
@@ -33,10 +33,12 @@ MCP_PROTOCOL_VERSION = "2024-11-05"
 
 # Default capabilities when no cache exists. Declares tool support so
 # MCP clients send tools/list, triggering cold bootstrap (FR-1.3).
-_DEFAULT_CAPABILITIES: Mapping = MappingProxyType({"tools": {}})
+_DEFAULT_CAPABILITIES: Mapping[str, Any] = MappingProxyType({"tools": {}})
 
 
-def _resolve_capabilities(backend_capabilities: dict, cache_data: dict) -> dict:
+def _resolve_capabilities(
+    backend_capabilities: dict[str, Any], cache_data: dict[str, Any]
+) -> dict[str, Any]:
     """Derive capabilities to store in cache.
 
     If backend returned non-empty capabilities, use them as-is.
@@ -45,7 +47,7 @@ def _resolve_capabilities(backend_capabilities: dict, cache_data: dict) -> dict:
     """
     if backend_capabilities:
         return backend_capabilities
-    derived: dict[str, dict] = {}
+    derived: dict[str, dict[str, Any]] = {}
     if "tools/list" in cache_data:
         derived["tools"] = {}
     if "resources/list" in cache_data:
@@ -79,11 +81,11 @@ class MessageRouter:
         self._writer = writer
         self._transport: BackendTransport | None = None
         self._id_mapper = IdMapper()
-        self._queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._failure_time: float | None = None
         self._initialized = False
 
-    async def handle_message(self, message: dict) -> None:
+    async def handle_message(self, message: dict[str, Any]) -> None:
         """Route a single incoming JSON-RPC message."""
         method = message.get("method", "")
         msg_id = message.get("id")
@@ -127,7 +129,7 @@ class MessageRouter:
                     method,
                 )
 
-    async def _handle_initialize(self, message: dict) -> None:
+    async def _handle_initialize(self, message: dict[str, Any]) -> None:
         """Respond to MCP initialize with proxy server info and capabilities."""
         msg_id = message.get("id")
         cache_data = self._cache.load()
@@ -151,7 +153,7 @@ class MessageRouter:
         )
         await self._writer.write_message(response)
 
-    async def _handle_cacheable(self, message: dict) -> None:
+    async def _handle_cacheable(self, message: dict[str, Any]) -> None:
         """Serve tools/list, resources/list, or prompts/list.
 
         Cache hit: respond immediately.
@@ -200,7 +202,7 @@ class MessageRouter:
                 make_error(id=msg_id, code=INTERNAL_ERROR, message=str(exc))
             )
 
-    async def _handle_forwarded_request(self, message: dict) -> None:
+    async def _handle_forwarded_request(self, message: dict[str, Any]) -> None:
         """Forward a request to the backend. Start backend if needed."""
         method = message.get("method", "")
         msg_id = message.get("id")
@@ -347,7 +349,7 @@ class MessageRouter:
 
         # Perform MCP initialize handshake
         internal_id = self._id_mapper.next_internal_id()
-        backend_capabilities: dict = {}
+        backend_capabilities: dict[str, Any] = {}
         try:
             init_result = await transport.request(
                 "initialize",
@@ -383,7 +385,7 @@ class MessageRouter:
         logger.info("[%s] Backend is active", self._config.server.name)
 
     async def _bootstrap_cache(
-        self, transport: BackendTransport, capabilities: dict | None = None
+        self, transport: BackendTransport, capabilities: dict[str, Any] | None = None
     ) -> None:
         """Fetch tools/list (and optionally resources/list, prompts/list) from backend."""
         cache = CacheData(cache_version=1, capabilities=capabilities or {})

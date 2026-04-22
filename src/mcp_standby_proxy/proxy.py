@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sys
+from typing import Any
 
 from mcp_standby_proxy.cache import CacheManager
 from mcp_standby_proxy.config import LoadedConfig
@@ -8,7 +9,7 @@ from mcp_standby_proxy.jsonrpc import JsonRpcReader, JsonRpcWriter
 from mcp_standby_proxy.lifecycle import LifecycleManager
 from mcp_standby_proxy.router import MessageRouter
 from mcp_standby_proxy.state import BackendState, StateMachine
-from mcp_standby_proxy.transport import create_transport
+from mcp_standby_proxy.transport import BackendTransport, create_transport
 
 
 class _ServerNameFormatter(logging.Formatter):
@@ -23,7 +24,7 @@ class _ServerNameFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         if not hasattr(record, "server_name"):
-            record.server_name = self._server_name  # type: ignore[attr-defined]
+            record.server_name = self._server_name
         return super().format(record)
 
 
@@ -52,7 +53,7 @@ class ProxyRunner:
         self._resolved_cache_path = loaded.resolved_cache_path
         self._verbose = verbose
         self._shutdown_event = asyncio.Event()
-        self._tasks: set[asyncio.Task] = set()
+        self._tasks: set[asyncio.Task[Any]] = set()
         self._router: MessageRouter | None = None
         self._sm: StateMachine | None = None
 
@@ -74,7 +75,7 @@ class ProxyRunner:
         )
         writer = JsonRpcWriter(sys.stdout.buffer)
 
-        def _transport_factory():
+        def _transport_factory() -> BackendTransport:
             return create_transport(self._config.backend, cwd=self._config_dir)
 
         router = MessageRouter(

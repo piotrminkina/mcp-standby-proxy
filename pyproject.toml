@@ -29,6 +29,7 @@ dev = [
   "pytest-asyncio",
   "ruff",
   "mypy",
+  "types-PyYAML",
   "uvicorn",
   "gitlint",
 ]

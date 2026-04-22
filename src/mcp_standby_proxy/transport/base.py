@@ -16,7 +16,7 @@ class BackendTransport(Protocol):
         """
         ...
 
-    async def request(self, method: str, params: Any = None, id: Any = None) -> dict:  # type: ignore[return]
+    async def request(self, method: str, params: Any = None, id: Any = None) -> dict[str, Any]:
         """Send JSON-RPC request and return the response as a raw dict.
 
         The transport handles framing (newline-delimited JSON, HTTP POST, etc.)

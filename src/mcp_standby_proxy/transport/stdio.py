@@ -8,7 +8,7 @@ import anyio
 from anyio import fail_after
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp.client.stdio import stdio_client, StdioServerParameters
-from mcp.shared.session import SessionMessage
+from mcp.shared.session import SessionMessage  # type: ignore[attr-defined]
 from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCNotification
 
 from mcp_standby_proxy.errors import TransportError
@@ -42,7 +42,7 @@ class StdioTransport:
         self._cwd = cwd
         self._read_stream: MemoryObjectReceiveStream[SessionMessage | Exception] | None = None
         self._write_stream: MemoryObjectSendStream[SessionMessage] | None = None
-        self._session_context: AbstractAsyncContextManager | None = None
+        self._session_context: AbstractAsyncContextManager[Any] | None = None
         self._connected = False
 
     async def connect(self) -> None:
@@ -74,7 +74,7 @@ class StdioTransport:
         self._session_context = ctx
         self._connected = True
 
-    async def request(self, method: str, params: Any = None, id: Any = None) -> dict:  # type: ignore[return]
+    async def request(self, method: str, params: Any = None, id: Any = None) -> dict[str, Any]:
         """Send a JSON-RPC request and return the response dict with matching id."""
         if self._write_stream is None or self._read_stream is None:
             raise TransportError("Transport is not connected")

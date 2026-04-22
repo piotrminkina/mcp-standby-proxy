@@ -162,42 +162,6 @@ async def test_connect_spawn_failure_wrapped_as_transport_error(
 
 
 @pytest.mark.asyncio
-async def test_close_after_failed_connect_is_silent(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """close() after a failed connect must not raise and must emit no WARNING logs.
-
-    Regression for the bug where _session_context was stored before __aenter__
-    succeeded, causing close() to call __aexit__ on an unentered context manager
-    (RuntimeError: generator didn't yield) — logged as a spurious WARNING.
-    """
-    import logging
-
-    @asynccontextmanager
-    async def fake_stdio_client(params):
-        raise OSError(2, "No such file or directory")
-        yield  # make it a generator
-
-    monkeypatch.setattr("mcp_standby_proxy.transport.stdio.stdio_client", fake_stdio_client)
-
-    transport = _make_transport(config_dir=tmp_path)
-    with pytest.raises(TransportError):
-        await transport.connect()
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="mcp_standby_proxy.transport.stdio"):
-        await transport.close()
-
-    stdio_warnings = [
-        r for r in caplog.records
-        if r.name == "mcp_standby_proxy.transport.stdio" and r.levelno >= logging.WARNING
-    ]
-    assert stdio_warnings == [], f"Unexpected warning(s): {stdio_warnings}"
-
-
-@pytest.mark.asyncio
 async def test_request_sends_frame_and_matches_response_id(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

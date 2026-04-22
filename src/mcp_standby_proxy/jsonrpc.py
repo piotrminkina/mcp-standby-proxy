@@ -10,12 +10,12 @@ INTERNAL_ERROR = -32603
 SERVER_NOT_INITIALIZED = -32002
 
 
-def make_response(id: Any, result: Any) -> dict:
+def make_response(id: Any, result: Any) -> dict[str, Any]:
     """Build a JSON-RPC 2.0 response."""
     return {"jsonrpc": "2.0", "id": id, "result": result}
 
 
-def make_error(id: Any, code: int, message: str, data: Any = None) -> dict:
+def make_error(id: Any, code: int, message: str, data: Any = None) -> dict[str, Any]:
     """Build a JSON-RPC 2.0 error response."""
     error: dict[str, Any] = {"code": code, "message": message}
     if data is not None:
@@ -23,7 +23,7 @@ def make_error(id: Any, code: int, message: str, data: Any = None) -> dict:
     return {"jsonrpc": "2.0", "id": id, "error": error}
 
 
-def make_notification(method: str, params: Any = None) -> dict:
+def make_notification(method: str, params: Any = None) -> dict[str, Any]:
     """Build a JSON-RPC 2.0 notification (no id)."""
     msg: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
     if params is not None:
@@ -37,7 +37,7 @@ class JsonRpcReader:
     def __init__(self, reader: asyncio.StreamReader) -> None:
         self._reader = reader
 
-    async def read_message(self) -> dict | None:
+    async def read_message(self) -> dict[str, Any] | None:
         """Read one JSON-RPC message. Returns None on EOF.
 
         Invalid JSON lines are skipped with a log warning.
@@ -56,7 +56,8 @@ class JsonRpcReader:
                 continue
 
             try:
-                return json.loads(line)
+                parsed: dict[str, Any] = json.loads(line)
+                return parsed
             except json.JSONDecodeError:
                 # Skip invalid lines; caller should not rely on ordering
                 continue
@@ -68,7 +69,7 @@ class JsonRpcWriter:
     def __init__(self, writer: asyncio.StreamWriter | BinaryIO) -> None:
         self._writer = writer
 
-    async def write_message(self, message: dict) -> None:
+    async def write_message(self, message: dict[str, Any]) -> None:
         """Serialize message as JSON + newline, write to stream, flush."""
         line = json.dumps(message, separators=(",", ":")) + "\n"
         encoded = line.encode("utf-8")
