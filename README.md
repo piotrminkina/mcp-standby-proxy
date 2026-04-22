@@ -35,7 +35,7 @@ MCP Client ←stdio→ mcp-standby-proxy ←SSE/HTTP/stdio→ Real MCP Server
 ### Installation
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/piotrminkina/mcp-standby-proxy.git
 cd mcp-standby-proxy
 uv sync
 ```
@@ -108,7 +108,7 @@ lifecycle:
     max_attempts: 60              # Total attempts before giving up
 
 cache:
-  path: "./my_server_cache.json"  # Parent directory must exist
+  path: "./my_server_cache.json"  # Resolved against the config file's directory
 ```
 
 ### Cold cache bootstrap
@@ -132,8 +132,6 @@ backend:
 
 - `idle_timeout` and `auto_refresh` are accepted in the config but ignored in
   the current version. They are reserved for post-MVP features.
-- `sse` and `streamable_http` transports are fully implemented. `stdio`
-  transport raises an error at startup (planned for a future release).
 
 ## CLI
 
@@ -150,33 +148,32 @@ privileges. **Review lifecycle commands before using a third-party config file.*
 
 ## Development
 
-```bash
-uv sync                          # Install dependencies
-uv run pytest                    # Run tests (unit + integration)
-uv run pytest -m smoke           # Run smoke tests (requires real server)
-uv run ruff check src/ tests/    # Lint
-```
-
-For Nuitka builds (post-MVP), use the Docker Compose `dev` service:
+All project commands run inside the DevContainer for full isolation from the
+host (see [ADR-001](docs/adr/ADR-001-devcontainer-isolation.md)):
 
 ```bash
-command docker compose run --rm dev bash
+devcontainer up --workspace-folder . --docker-path podman
+devcontainer exec --workspace-folder . --docker-path podman uv run pytest
+devcontainer exec --workspace-folder . --docker-path podman uv run pytest -m smoke
+devcontainer exec --workspace-folder . --docker-path podman uv run ruff check src/ tests/
 ```
 
 ## Project Status
 
-**MVP implementation complete.**
+**MVP complete.** All three backend transports (SSE, Streamable HTTP, stdio)
+are implemented and tested.
 
-See [PRD](docs/plans/prd.md) for requirements, [Tech Stack](docs/plans/tech-stack.md)
-for technology choices, and [Tech Spec](docs/plans/tech-spec.md) for architecture details.
+See [PRD](docs/plans/prd.md) for the full capability matrix and requirements,
+[Tech Stack](docs/plans/tech-stack.md) for technology choices, and
+[Tech Spec](docs/plans/tech-spec.md) for architecture details.
 
 ## Roadmap (post-MVP)
 
-- `stdio` backend transport (child process + separate infrastructure lifecycle)
 - Idle timeout: automatically stop backend after inactivity
 - Cache auto-refresh: compare live vs cached on reconnect
+- `warm` / `validate` CLI subcommands
+- Client capability forwarding + server-to-client request forwarding
 - Nuitka binary builds for zero-dependency distribution
-- Graceful restart on config change
 
 ## License
 
