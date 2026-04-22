@@ -1,23 +1,40 @@
+# SSE backend fronted by a systemd user service.
+#
+# The start/stop commands target the service unit directly (not socket
+# activation): `systemctl start` brings the service up, `systemctl stop`
+# brings it down. Assumes `kroki.service` is installed under
+# `~/.config/systemd/user/` and runs the Kroki server on port 5090.
+#
+# For a socket-activated variant, point `start` at the .socket unit and
+# `stop` at the proxy service that wraps it.
+
 version: 1
+
 server:
   name: "kroki"
   version: "1.0.0"
+  instructions: "Kroki diagram rendering MCP server"
+
 backend:
   transport: sse
   url: "http://localhost:5090/sse"
+
 lifecycle:
   start:
     command: "systemctl"
-    args: ["--user", "start", "kroki.socket"]
+    args: ["--user", "start", "kroki.service"]
+    timeout: 30
   stop:
     command: "systemctl"
-    args: ["--user", "stop", "kroki-proxy.service"]
+    args: ["--user", "stop", "kroki.service"]
+    timeout: 30
   healthcheck:
     type: http
     url: "http://localhost:5090/sse"
     interval: 1
     max_attempts: 60
   idle_timeout: 300
+
 cache:
   path: "./kroki_cache.json"
   auto_refresh: true

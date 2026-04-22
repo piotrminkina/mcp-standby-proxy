@@ -1,0 +1,50 @@
+# Stdio backend with a systemd-managed dependency service.
+#
+# The MCP server itself is a child process (`npx @zilliz/claude-context-mcp`)
+# spawned by the proxy. It talks to Milvus over gRPC at `localhost:19530`.
+# Milvus runs as a separate systemd user service — the proxy starts/stops
+# it directly via `systemctl --user start|stop milvus.service` (no socket
+# activation).
+#
+# Start order is enforced by construction: the proxy awaits `lifecycle.start`
+# + healthcheck before spawning the child process, so the child never sees a
+# cold-start ECONNREFUSED.
+
+version: 1
+
+server:
+  name: "claude-context"
+  version: "1.0.0"
+  instructions: "Claude Context MCP server — semantic code search and indexing via Milvus vector database with Ollama embeddings"
+
+backend:
+  transport: stdio
+  command: "npx"
+  args:
+    - "@zilliz/claude-context-mcp@latest"
+  env:
+    MILVUS_ADDRESS: "localhost:19530"
+    EMBEDDING_PROVIDER: "Ollama"
+    OLLAMA_HOST: "http://localhost:11434"
+    OLLAMA_MODEL: "nomic-embed-text"
+
+lifecycle:
+  start:
+    command: "systemctl"
+    args: ["--user", "start", "milvus.service"]
+    timeout: 120
+  stop:
+    command: "systemctl"
+    args: ["--user", "stop", "milvus.service"]
+    timeout: 60
+  healthcheck:
+    type: http
+    url: "http://127.0.0.1:9091/healthz"
+    interval: 3
+    max_attempts: 60
+    timeout: 5
+  idle_timeout: 600
+
+cache:
+  path: ".cache/claude-context-mcp.json"
+  auto_refresh: true

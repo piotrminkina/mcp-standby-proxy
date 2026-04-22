@@ -75,7 +75,11 @@ uv run mcp-standby-proxy serve -c my-server.yaml
 
 ## Configuration
 
-See [`examples/kroki.yaml`](examples/kroki.yaml) for a full reference config.
+Reference configs per transport:
+
+- [`examples/kroki.yaml`](examples/kroki.yaml) — **SSE** backend, systemd user service lifecycle
+- [`examples/firecrawl.yaml`](examples/firecrawl.yaml) — **Streamable HTTP** backend, Docker Compose lifecycle
+- [`examples/claude-context.yaml`](examples/claude-context.yaml) — **stdio** backend with a dependency service (Milvus) managed via `systemctl`
 
 ```yaml
 version: 1

@@ -1,0 +1,45 @@
+# Streamable HTTP backend fronted by a Docker Compose stack.
+#
+# `lifecycle.start` / `lifecycle.stop` run `docker compose` with `cwd` set
+# to the config file's parent directory — so the sibling
+# `docker-compose.yml` is picked up automatically without absolute paths.
+#
+# The proxy polls the backend's HTTP health endpoint until it returns 2xx,
+# then opens the Streamable HTTP transport on `backend.url`.
+
+version: 1
+
+server:
+  name: "firecrawl"
+  version: "1.0.0"
+  instructions: "Firecrawl web scraping, search, crawling, and extraction MCP server"
+
+backend:
+  transport: streamable_http
+  url: "http://localhost:5100/mcp"
+
+lifecycle:
+  start:
+    command: "docker"
+    args:
+      - "compose"
+      - "up"
+      - "-d"
+    timeout: 120
+  stop:
+    command: "docker"
+    args:
+      - "compose"
+      - "stop"
+    timeout: 60
+  healthcheck:
+    type: http
+    url: "http://localhost:5100/health"
+    interval: 3
+    max_attempts: 60
+    timeout: 5
+  idle_timeout: 300
+
+cache:
+  path: ".cache/firecrawl-mcp.json"
+  auto_refresh: true
