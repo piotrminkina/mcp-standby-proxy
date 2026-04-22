@@ -9,6 +9,17 @@ infrastructure when the agent makes a real `tools/call` request. Backend lifecyc
 is controlled via configurable shell commands — the proxy is agnostic to the
 underlying runtime (containers, service managers, bare processes).
 
+## Why
+
+MCP clients connect to **all** registered MCP servers at startup to fetch
+`tools/list`. This triggers every backend stack to start immediately — even
+when the user has no intention of using those tools in the current session.
+
+| Session start (before) | Session start (after) |
+|------------------------|-----------------------|
+| 15+ processes, 1.5–3 GB RAM, 30–120 s delay | 0 backend processes, ~25 MB per proxy, instant |
+| All backends running regardless of need | Backends start only when the agent calls a tool |
+
 ## How it works
 
 ```
@@ -30,7 +41,7 @@ MCP Client ←stdio→ mcp-standby-proxy ←SSE/HTTP/stdio→ Real MCP Server
 ### Prerequisites
 
 - [uv](https://docs.astral.sh/uv/) (manages Python versions automatically)
-- A running MCP server backend to proxy (e.g., a Docker Compose stack)
+- A running MCP server backend to proxy (e.g., a Docker Compose stack, a systemd user service, or an `npx` stdio package)
 
 ### Installation
 
@@ -55,7 +66,7 @@ cp examples/kroki.yaml my-server.yaml
 uv run mcp-standby-proxy serve -c my-server.yaml
 ```
 
-3. Register in your MCP client config (e.g., Claude Desktop):
+3. Register in your MCP client config (e.g., Claude Desktop, Claude Code):
 
 ```json
 {
@@ -81,6 +92,8 @@ Reference configs per transport:
 - [`examples/firecrawl.yaml`](examples/firecrawl.yaml) — **Streamable HTTP** backend, Docker Compose lifecycle
 - [`examples/claude-context.yaml`](examples/claude-context.yaml) — **stdio** backend with a dependency service (Milvus) managed via `systemctl`
 
+Minimal schema:
+
 ```yaml
 version: 1
 
@@ -91,6 +104,11 @@ server:
 backend:
   transport: sse                  # sse | streamable_http | stdio
   url: "http://localhost:5090/sse" # Required for sse / streamable_http
+  # For stdio backends:
+  # command: "npx"
+  # args: ["@modelcontextprotocol/server-something"]
+  # env:
+  #   FOO: "bar"
 
 lifecycle:
   start:
@@ -110,6 +128,8 @@ lifecycle:
 cache:
   path: "./my_server_cache.json"  # Resolved against the config file's directory
 ```
+
+Full schema and path-resolution rules: [Config Spec](docs/plans/config-spec.md).
 
 ### Cold cache bootstrap
 
@@ -141,22 +161,21 @@ backend:
 | `-v` | INFO logging to stderr |
 | `-vv` | DEBUG logging to stderr |
 
+Logs always go to stderr. Stdout is reserved exclusively for JSON-RPC traffic
+to the MCP client — piping or redirecting stdout will corrupt the protocol
+stream.
+
 ## Security
 
-Lifecycle commands in the YAML config execute with the proxy process's full
-privileges. **Review lifecycle commands before using a third-party config file.**
+The YAML config file is **trusted input**. `lifecycle.start` and
+`lifecycle.stop` are executed as arbitrary shell commands with the proxy
+process's full privileges, and `backend.env` is merged into the child
+process environment for stdio backends.
 
-## Development
-
-All project commands run inside the DevContainer for full isolation from the
-host (see [ADR-001](docs/adr/ADR-001-devcontainer-isolation.md)):
-
-```bash
-devcontainer up --workspace-folder . --docker-path podman
-devcontainer exec --workspace-folder . --docker-path podman uv run pytest
-devcontainer exec --workspace-folder . --docker-path podman uv run pytest -m smoke
-devcontainer exec --workspace-folder . --docker-path podman uv run ruff check src/ tests/
-```
+**Do not run `mcp-standby-proxy` against a config file you did not author or
+review.** A hostile YAML can execute any command when the proxy starts or
+stops the backend. This includes configs downloaded from third parties,
+pasted from chat, or committed to repositories you don't control.
 
 ## Project Status
 
@@ -174,6 +193,11 @@ See [PRD](docs/plans/prd.md) for the full capability matrix and requirements,
 - `warm` / `validate` CLI subcommands
 - Client capability forwarding + server-to-client request forwarding
 - Nuitka binary builds for zero-dependency distribution
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development environment setup,
+testing, and contribution workflow.
 
 ## License
 
