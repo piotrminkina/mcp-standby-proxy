@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import anyio
+from anyio import fail_after
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.shared.session import SessionMessage
@@ -13,6 +14,11 @@ from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCNotification
 from mcp_standby_proxy.errors import TransportError
 
 logger = logging.getLogger(__name__)
+
+# Maximum time (seconds) allowed for a zero-buffer MemoryObjectStream send()
+# to hand off a message to the SDK's TaskGroup reader. If the TaskGroup has
+# crashed or stalled, send() would block indefinitely without this bound.
+WRITE_HANDOFF_TIMEOUT_SECONDS = 10.0
 
 
 class StdioTransport:
@@ -82,11 +88,13 @@ class StdioTransport:
             )
         )
         try:
-            # WARNING: zero-buffer MemoryObjectStream — send() blocks until the SDK's
-            # TaskGroup consumes the message. If the TaskGroup stops (crash, cancellation),
-            # this call hangs indefinitely. Same risk exists in SseTransport.
-            # TODO: consider wrapping with anyio.fail_after() for both transports.
-            await self._write_stream.send(SessionMessage(message=msg))
+            with fail_after(WRITE_HANDOFF_TIMEOUT_SECONDS):
+                await self._write_stream.send(SessionMessage(message=msg))
+        except TimeoutError as exc:
+            self._connected = False
+            raise TransportError(
+                "Write stream handoff timed out after 10s - backend TaskGroup may be unresponsive"
+            ) from exc
         except (anyio.ClosedResourceError, anyio.EndOfStream) as exc:
             self._connected = False
             raise TransportError(f"Write stream closed: {exc}") from exc
@@ -121,11 +129,13 @@ class StdioTransport:
             )
         )
         try:
-            # WARNING: zero-buffer MemoryObjectStream — send() blocks until the SDK's
-            # TaskGroup consumes the message. If the TaskGroup stops (crash, cancellation),
-            # this call hangs indefinitely. Same risk exists in SseTransport.
-            # TODO: consider wrapping with anyio.fail_after() for both transports.
-            await self._write_stream.send(SessionMessage(message=msg))
+            with fail_after(WRITE_HANDOFF_TIMEOUT_SECONDS):
+                await self._write_stream.send(SessionMessage(message=msg))
+        except TimeoutError as exc:
+            self._connected = False
+            raise TransportError(
+                "Write stream handoff timed out after 10s - backend TaskGroup may be unresponsive"
+            ) from exc
         except (anyio.ClosedResourceError, anyio.EndOfStream) as exc:
             self._connected = False
             raise TransportError(f"Write stream closed: {exc}") from exc

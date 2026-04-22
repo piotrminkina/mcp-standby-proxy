@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -158,3 +159,78 @@ async def test_response_matching_ignores_wrong_id() -> None:
     assert result["result"]["answer"] == 42
 
     await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# Tests — phantom __aexit__ regression
+# ---------------------------------------------------------------------------
+
+async def test_close_after_failed_connect_is_silent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """close() after a failed connect must not raise and must emit no WARNING logs.
+
+    Regression for the phantom __aexit__ bug: _session_context was previously
+    stored before __aenter__ succeeded.  After the fix, _session_context is None
+    when __aenter__ raises, so close() has nothing to __aexit__ on.
+    """
+    @asynccontextmanager
+    async def _failing_ctx(url, **kwargs):
+        raise ConnectionError("SSE server refused connection")
+        yield  # pragma: no cover
+
+    transport = SseTransport("http://localhost/sse")
+
+    with patch("mcp_standby_proxy.transport.sse.sse_client", _failing_ctx):
+        with pytest.raises(ConnectionError):
+            await transport.connect()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="mcp_standby_proxy.transport.sse"):
+        await transport.close()
+
+    sse_warnings = [
+        r for r in caplog.records
+        if r.name == "mcp_standby_proxy.transport.sse" and r.levelno >= logging.WARNING
+    ]
+    assert sse_warnings == [], f"Unexpected warning(s): {sse_warnings}"
+
+
+# ---------------------------------------------------------------------------
+# Tests — write timeout (Item 3)
+# ---------------------------------------------------------------------------
+
+async def test_request_send_times_out_after_10s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the write stream send() hangs, request() raises TransportError with timeout message.
+
+    Technique A: monkeypatch anyio.fail_after in the sse module to raise
+    TimeoutError immediately — no real sleeping.
+    """
+    import mcp_standby_proxy.transport.sse as sse_module
+
+    _, server_recv = _make_streams()
+    client_write, _ = _make_streams()
+
+    transport = SseTransport("http://localhost/sse")
+
+    @asynccontextmanager
+    async def _ctx(url, **kwargs):
+        yield server_recv, client_write
+
+    with patch("mcp_standby_proxy.transport.sse.sse_client", _ctx):
+        await transport.connect()
+
+    class _ImmediateTimeoutScope:
+        def __enter__(self):
+            raise TimeoutError("simulated write timeout")
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(sse_module, "fail_after", lambda s: _ImmediateTimeoutScope())
+
+    with pytest.raises(TransportError, match="timed out after 10s"):
+        await transport.request("tools/list", id="p-1")
+
+    assert not transport.is_connected()

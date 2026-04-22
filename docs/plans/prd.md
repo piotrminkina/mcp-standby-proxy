@@ -69,7 +69,7 @@ intention of using those tools in the current session.
 | FR-5 | Configuration | MVP | implemented |
 | FR-6 | State machine | MVP | implemented |
 | FR-7 | Streamable HTTP backend transport | post-MVP | implemented |
-| FR-8 | stdio backend transport | post-MVP | implemented (FR-8.3 timeouts pending — see below) |
+| FR-8 | stdio backend transport | post-MVP | implemented |
 | FR-9 | Idle timeout with auto-shutdown | post-MVP | proposed |
 | FR-10 | Background schema refresh | post-MVP | proposed |
 | FR-11 | Standalone binary build | post-MVP | proposed |
@@ -237,15 +237,16 @@ Support for stdio-based MCP backends with separate infrastructure lifecycle.
   shutdown (close stdin → wait → SIGTERM → SIGKILL). Child process is spawned in a
   new session (`start_new_session=True`) so signals are delivered to the whole
   process group.
-- FR-8.3: **Shutdown timeouts are fixed in v1: 10 seconds between `close(stdin)`
-  and SIGTERM, and 10 seconds between SIGTERM and SIGKILL.** Not user-configurable.
-  Rationale: well-behaved MCP servers exit on stdin close within single-digit
-  seconds; 10s is lenient enough for GC/finalizer-heavy runtimes (JVM, Node with
-  large caches) without holding up SIGTERM-driven proxy shutdown indefinitely.
-  **Implementation note (as of 2026-04-22):** current implementation inherits the
-  MCP SDK's 2s/2s timeouts. Extending to 10s/10s is tracked as follow-up work
-  (either wrap the SDK's `stdio_client` shutdown or run our own termination
-  sequence after exiting the SDK context).
+- FR-8.3: **Shutdown timeouts are inherited from the MCP SDK: 2 seconds
+  between `close(stdin)` and SIGTERM, and 2 seconds between SIGTERM and
+  SIGKILL.** Not user-configurable. Rationale: the SDK's value is
+  MCP-spec-aligned; well-behaved MCP servers exit immediately on stdin close,
+  and unresponsive servers should be killed faster rather than slower during
+  shutdown. Extending timeouts would require forking the SDK's `stdio_client`
+  (its `Process` handle is a generator-frame local and the 2s constant is
+  not reachable from outside) — the maintenance cost is not justified by any
+  observed backend needing more than 2s to exit gracefully. If this surfaces
+  as a problem with a legitimate backend, reopen as a separate ticket.
 - FR-8.4: Stdout frames exchanged through the child process pipes. Stderr is
   pass-through to the proxy's stderr — no capture, no prefixing (see FR-19).
 
@@ -433,7 +434,7 @@ Quality-of-life improvements. Build after MVP is proven in real sessions.
 ### In scope (post-MVP)
 
 - Streamable HTTP backend transport — FR-7 *(implemented)*
-- stdio backend transport (child process + separate infrastructure) — FR-8 *(implemented; FR-8.3 timeouts pending)*
+- stdio backend transport (child process + separate infrastructure) — FR-8 *(implemented)*
 - Idle timeout with auto-shutdown — FR-9
 - Background schema refresh + `notifications/*/list_changed` — FR-10
 - Generic capability caching (`resources/list`, `prompts/list`) — FR-1.4
@@ -666,8 +667,8 @@ Acceptance criteria:
 - Proxy starts infrastructure (lifecycle.start), waits for healthcheck.
 - Proxy spawns the MCP server child process (backend.command) after infrastructure
   is ready.
-- On shutdown: closes child process first (close stdin → wait 10s → SIGTERM → wait
-  10s → SIGKILL), then stops infrastructure.
+- On shutdown: closes child process first (close stdin → wait 2s → SIGTERM → wait
+  2s → SIGKILL), then stops infrastructure.
 
 ---
 
@@ -753,8 +754,8 @@ Targets to verify when each respective feature ships.
 | FR-15 Orphan detection | Detection accuracy | 100% (no duplicate spawn when backend alive) |
 | FR-17 Capability forwarding | Backend warning rate for missing capabilities | 0 when client declared capabilities |
 | FR-18 Bidi forwarding | Server→client→server round-trip overhead | < 100ms proxy-added latency |
-| FR-8.3 Shutdown timeouts | stdio backend shutdown duration on cooperating backend | < 3s (SIGTERM path not reached) |
-| FR-8.3 Shutdown timeouts | stdio backend shutdown duration on unresponsive backend | < 22s (10s + 10s + kill) |
+| FR-8.3 Shutdown timeouts | stdio backend shutdown duration on cooperating backend | < 2s (SIGTERM path not reached) |
+| FR-8.3 Shutdown timeouts | stdio backend shutdown duration on unresponsive backend | < 5s (2s + 2s + kill) |
 
 ## 7. Risks & Challenges
 
@@ -771,7 +772,7 @@ Targets to verify when each respective feature ships.
 | Cache format incompatibility after proxy upgrade | Low | Low | FR-1.5 cache versioning. Invalid cache is deleted and rebuilt via cold bootstrap. |
 | Backend features degraded due to missing client capabilities | Medium | High | Proxy sends empty capabilities, backend cannot use `roots/list`, `sampling/createMessage`. FR-17 fixes this. FR-18 adds full bidirectional support. |
 | Server-to-client requests silently dropped | Medium | Medium | Transport read loop only matches response IDs, discards server-initiated messages. FR-18 introduces background reader task and forwarding. |
-| stdio backend with long GC pause on SIGTERM | Low | Medium | FR-8.3 10s+10s timeouts tolerate most JVM/Node shutdowns. SIGKILL fallback bounds worst case. |
+| stdio backend with long GC pause on SIGTERM | Low | Low | FR-8.3 2s+2s (SDK default) may SIGKILL a legitimately-slow backend. Reopen and consider a fork of the SDK's `stdio_client` if this surfaces in practice. |
 | Stdout contamination corrupts JSON-RPC stream | High | Low | FR-19.4 hard invariant: stderr-only logging. Enforced by log handler configuration; regression risk on new code paths. |
 | **OSS publication — unsolicited issue triage load** | Low | Medium | Document expectations in README (personal tool, best-effort support). Add issue templates. |
 | **OSS publication — supply chain via lifecycle.command** | Medium | Low | Config is trusted input (§8). Warn users in README that YAML files downloaded from third parties can execute arbitrary commands at `lifecycle.start` time. |
@@ -789,4 +790,4 @@ Targets to verify when each respective feature ships.
 | **Logs on stderr only.** No structured telemetry export. | Compatible with service managers that capture stderr (systemd-journald, Docker log driver). Sufficient for personal tool. FR-19.4 makes stdout-contamination a hard invariant. |
 | **Cache invalidation is manual (MVP).** Delete cache file + restart proxy. `warm` command available in post-MVP phase 1. | Users must remember to manually invalidate cache after backend updates. No automatic detection of tool changes until schema refresh (post-MVP). |
 | **MCP protocol version not enforced by proxy (FR-20).** | Mismatched client/backend versions surface as backend-side errors on tool calls, not proxy rejections. Version negotiation is between client and backend; proxy is transparent. |
-| **stdio shutdown timeouts fixed at 10s + 10s (FR-8.3).** | Not configurable in v1. Legitimate backends with >20s shutdown time (rare) would be SIGKILLed. Revisit if observed. |
+| **stdio shutdown timeouts inherited from MCP SDK at 2s + 2s (FR-8.3).** | Not configurable in v1. Backends that legitimately need >4s to exit gracefully would be SIGKILLed. Extending would require forking the SDK's `stdio_client`; revisit if observed. |

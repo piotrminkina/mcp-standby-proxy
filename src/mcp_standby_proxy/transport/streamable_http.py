@@ -3,6 +3,7 @@ from contextlib import AbstractAsyncContextManager
 from typing import Any
 
 import anyio
+from anyio import fail_after
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.session import SessionMessage
@@ -11,6 +12,11 @@ from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCNotification
 from mcp_standby_proxy.errors import TransportError
 
 logger = logging.getLogger(__name__)
+
+# Maximum time (seconds) allowed for a zero-buffer MemoryObjectStream send()
+# to hand off a message to the SDK's TaskGroup reader.  If the TaskGroup has
+# crashed or stalled, send() would block indefinitely without this bound.
+WRITE_HANDOFF_TIMEOUT_SECONDS = 10.0
 
 
 class StreamableHttpTransport:
@@ -29,14 +35,22 @@ class StreamableHttpTransport:
         Stores the read/write streams for subsequent request/notify calls.
         Session ID management is delegated to the SDK: it tracks the
         Mcp-Session-Id header internally and sends DELETE on __aexit__.
+
+        `_session_context` is assigned only after a successful `__aenter__` so
+        that `close()` called after a failed connect does not attempt `__aexit__`
+        on an unentered context manager.
         """
         if self._connected:
             return
         ctx = streamable_http_client(self._url)
-        self._session_context = ctx
-        read_stream, write_stream, _get_session_id = await ctx.__aenter__()
+        try:
+            read_stream, write_stream, _get_session_id = await ctx.__aenter__()
+        except Exception:
+            self._connected = False
+            raise
         self._read_stream = read_stream
         self._write_stream = write_stream
+        self._session_context = ctx
         self._connected = True
 
     async def request(self, method: str, params: Any = None, id: Any = None) -> dict:  # type: ignore[return]
@@ -53,11 +67,13 @@ class StreamableHttpTransport:
             )
         )
         try:
-            # WARNING: zero-buffer MemoryObjectStream — send() blocks until the SDK's
-            # TaskGroup consumes the message. If the TaskGroup stops (crash, cancellation),
-            # this call hangs indefinitely. Same risk exists in SseTransport.
-            # TODO: consider wrapping with anyio.fail_after() for both transports.
-            await self._write_stream.send(SessionMessage(message=msg))
+            with fail_after(WRITE_HANDOFF_TIMEOUT_SECONDS):
+                await self._write_stream.send(SessionMessage(message=msg))
+        except TimeoutError as exc:
+            self._connected = False
+            raise TransportError(
+                "Write stream handoff timed out after 10s - backend TaskGroup may be unresponsive"
+            ) from exc
         except (anyio.ClosedResourceError, anyio.EndOfStream) as exc:
             self._connected = False
             raise TransportError(f"Write stream closed: {exc}") from exc
@@ -92,11 +108,13 @@ class StreamableHttpTransport:
             )
         )
         try:
-            # WARNING: zero-buffer MemoryObjectStream — send() blocks until the SDK's
-            # TaskGroup consumes the message. If the TaskGroup stops (crash, cancellation),
-            # this call hangs indefinitely. Same risk exists in SseTransport.
-            # TODO: consider wrapping with anyio.fail_after() for both transports.
-            await self._write_stream.send(SessionMessage(message=msg))
+            with fail_after(WRITE_HANDOFF_TIMEOUT_SECONDS):
+                await self._write_stream.send(SessionMessage(message=msg))
+        except TimeoutError as exc:
+            self._connected = False
+            raise TransportError(
+                "Write stream handoff timed out after 10s - backend TaskGroup may be unresponsive"
+            ) from exc
         except (anyio.ClosedResourceError, anyio.EndOfStream) as exc:
             self._connected = False
             raise TransportError(f"Write stream closed: {exc}") from exc

@@ -4,6 +4,7 @@ All tests monkeypatch `mcp_standby_proxy.transport.stdio.stdio_client` with a
 fake async context manager that exposes two anyio memory streams, so no real
 subprocess is spawned.
 """
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -407,4 +408,117 @@ async def test_close_swallows_exit_error(
 def test_is_connected_false_before_connect(tmp_path: Path) -> None:
     """A freshly constructed StdioTransport is not connected."""
     transport = _make_transport(config_dir=tmp_path)
+    assert transport.is_connected() is False
+
+
+@pytest.mark.asyncio
+async def test_close_after_failed_connect_is_silent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """After a failed connect, close() must emit no WARNING on the transport logger.
+
+    Regression for the "phantom __aexit__" bug: _session_context stored before
+    __aenter__ succeeded, causing close() to call __aexit__ on an unentered
+    context manager (RuntimeError: generator didn't yield) — logged as a
+    spurious WARNING.
+    """
+
+    @asynccontextmanager
+    async def fake_stdio_client(params):
+        raise OSError(2, "No such file or directory")
+        yield  # make it a generator
+
+    monkeypatch.setattr("mcp_standby_proxy.transport.stdio.stdio_client", fake_stdio_client)
+
+    transport = _make_transport(config_dir=tmp_path)
+    with pytest.raises(TransportError):
+        await transport.connect()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="mcp_standby_proxy.transport.stdio"):
+        await transport.close()
+
+    stdio_warnings = [
+        r for r in caplog.records
+        if r.name == "mcp_standby_proxy.transport.stdio"
+        and r.levelno >= logging.WARNING
+    ]
+    assert stdio_warnings == [], (
+        f"Expected no WARNING from stdio logger; got: {[r.message for r in stdio_warnings]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests — write timeout
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_request_send_times_out_after_10s_when_taskgroup_unresponsive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When the write stream send() hangs, request() raises TransportError after 10s.
+
+    Technique: monkeypatch fail_after in the stdio module to raise TimeoutError
+    immediately — no real sleeping.
+    """
+    import mcp_standby_proxy.transport.stdio as stdio_module
+
+    read_recv, write_send, _feed, _drain = _make_streams()
+
+    @asynccontextmanager
+    async def fake_stdio_client(params):
+        yield read_recv, write_send
+
+    monkeypatch.setattr("mcp_standby_proxy.transport.stdio.stdio_client", fake_stdio_client)
+
+    class _ImmediateTimeoutScope:
+        def __enter__(self):
+            raise TimeoutError("simulated write timeout")
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(stdio_module, "fail_after", lambda s: _ImmediateTimeoutScope())
+
+    transport = _make_transport(config_dir=tmp_path)
+    await transport.connect()
+
+    with pytest.raises(TransportError, match="timed out after 10s"):
+        await transport.request("tools/list", id=1)
+
+    assert transport.is_connected() is False
+
+
+@pytest.mark.asyncio
+async def test_notify_send_times_out_after_10s_when_taskgroup_unresponsive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When the write stream send() hangs, notify() raises TransportError after 10s."""
+    import mcp_standby_proxy.transport.stdio as stdio_module
+
+    read_recv, write_send, _feed, _drain = _make_streams()
+
+    @asynccontextmanager
+    async def fake_stdio_client(params):
+        yield read_recv, write_send
+
+    monkeypatch.setattr("mcp_standby_proxy.transport.stdio.stdio_client", fake_stdio_client)
+
+    class _ImmediateTimeoutScope:
+        def __enter__(self):
+            raise TimeoutError("simulated write timeout")
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(stdio_module, "fail_after", lambda s: _ImmediateTimeoutScope())
+
+    transport = _make_transport(config_dir=tmp_path)
+    await transport.connect()
+
+    with pytest.raises(TransportError, match="timed out after 10s"):
+        await transport.notify("notifications/progress", params={"progress": 50})
+
     assert transport.is_connected() is False

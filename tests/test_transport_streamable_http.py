@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -192,7 +193,6 @@ async def test_close_logs_warning_when_aexit_raises(caplog: pytest.LogCaptureFix
     failing_ctx.__aexit__ = AsyncMock(side_effect=RuntimeError("server gone"))
     transport._session_context = failing_ctx
 
-    import logging
     with caplog.at_level(logging.WARNING, logger="mcp_standby_proxy.transport.streamable_http"):
         await transport.close()  # must not raise
 
@@ -219,3 +219,88 @@ async def test_connect_when_aenter_raises_stays_disconnected() -> None:
     assert not transport.is_connected()
     # close() on an unconnected transport must be safe
     await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# Tests — phantom __aexit__ regression
+# ---------------------------------------------------------------------------
+
+async def test_close_after_failed_connect_is_silent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """close() after a failed connect must not raise and must emit no WARNING logs.
+
+    Regression for the phantom __aexit__ bug: _session_context was previously
+    stored before __aenter__ succeeded.  After the fix, _session_context is None
+    when __aenter__ raises, so close() has nothing to __aexit__ on.
+    """
+    @asynccontextmanager
+    async def _failing_ctx(url, **kwargs):
+        raise ConnectionError("HTTP server refused connection")
+        yield  # pragma: no cover
+
+    transport = StreamableHttpTransport("http://localhost:8080/mcp")
+
+    with patch(
+        "mcp_standby_proxy.transport.streamable_http.streamable_http_client",
+        _failing_ctx,
+    ):
+        with pytest.raises(ConnectionError):
+            await transport.connect()
+
+    caplog.clear()
+    with caplog.at_level(
+        logging.WARNING, logger="mcp_standby_proxy.transport.streamable_http"
+    ):
+        await transport.close()
+
+    http_warnings = [
+        r for r in caplog.records
+        if r.name == "mcp_standby_proxy.transport.streamable_http"
+        and r.levelno >= logging.WARNING
+    ]
+    assert http_warnings == [], f"Unexpected warning(s): {http_warnings}"
+
+
+# ---------------------------------------------------------------------------
+# Tests — write timeout (Item 3)
+# ---------------------------------------------------------------------------
+
+async def test_request_send_times_out_after_10s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the write stream send() hangs, request() raises TransportError with timeout message.
+
+    Technique A: monkeypatch anyio.fail_after in the streamable_http module to
+    raise TimeoutError immediately — no real sleeping.
+    """
+    import mcp_standby_proxy.transport.streamable_http as http_module
+
+    _, server_recv = _make_streams()
+    client_write, _ = _make_streams()
+
+    transport = StreamableHttpTransport("http://localhost:8080/mcp")
+
+    @asynccontextmanager
+    async def _ctx(url, **kwargs):
+        yield server_recv, client_write, lambda: None
+
+    with patch(
+        "mcp_standby_proxy.transport.streamable_http.streamable_http_client", _ctx
+    ):
+        await transport.connect()
+
+    class _ImmediateTimeoutScope:
+        def __enter__(self):
+            raise TimeoutError("simulated write timeout")
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(
+        http_module, "fail_after", lambda s: _ImmediateTimeoutScope()
+    )
+
+    with pytest.raises(TransportError, match="timed out after 10s"):
+        await transport.request("tools/list", id="p-1")
+
+    assert not transport.is_connected()
