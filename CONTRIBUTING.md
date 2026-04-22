@@ -6,14 +6,14 @@ conventions.
 
 ## Development environment
 
-The project uses a **DevContainer** (Podman + `@devcontainers/cli`) for full
+The project uses a **DevContainer** (Docker + `@devcontainers/cli`) for full
 isolation of dependencies from the host OS. See
 [ADR-001](docs/adr/ADR-001-devcontainer-isolation.md) for the rationale.
 
 ### Start the DevContainer
 
 ```bash
-devcontainer up --workspace-folder . --docker-path podman
+devcontainer up --workspace-folder .
 ```
 
 ### Run project commands inside it
@@ -22,11 +22,11 @@ All project commands (`uv sync`, tests, lint, type checks) run inside the
 DevContainer:
 
 ```bash
-devcontainer exec --workspace-folder . --docker-path podman uv sync
-devcontainer exec --workspace-folder . --docker-path podman uv run pytest
-devcontainer exec --workspace-folder . --docker-path podman uv run pytest -m smoke
-devcontainer exec --workspace-folder . --docker-path podman uv run ruff check src/ tests/
-devcontainer exec --workspace-folder . --docker-path podman uv run mypy src/
+devcontainer exec --workspace-folder . uv sync
+devcontainer exec --workspace-folder . uv run pytest
+devcontainer exec --workspace-folder . uv run pytest -m smoke
+devcontainer exec --workspace-folder . uv run ruff check src/ tests/
+devcontainer exec --workspace-folder . uv run mypy src/
 ```
 
 Do **not** install project dependencies or run tools on the host — the
@@ -35,7 +35,7 @@ DevContainer is the canonical environment.
 ### Tear down
 
 ```bash
-podman rm -f $(podman ps -aq --filter label=devcontainer.local_folder=$(pwd))
+docker rm -f $(docker ps -aq --filter label=devcontainer.local_folder=$(pwd))
 ```
 
 ## Testing
@@ -64,7 +64,7 @@ git config core.hooksPath .githooks
 - Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`.
 - Scopes match modules: `proxy`, `lifecycle`, `transport`, `config`, `cache`,
   `healthcheck`, `cli`, `idle`. Use `repo` for project-wide changes.
-- Subject line under 72 characters. Body explains the **why**, not the what.
+- Subject line under 120 characters. Body explains the **why**, not the what.
 - Full conventions: [`CLAUDE.md`](CLAUDE.md).
 
 ## Coding conventions

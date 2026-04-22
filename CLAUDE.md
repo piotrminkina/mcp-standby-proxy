@@ -14,26 +14,26 @@ and [Tech Stack](docs/plans/tech-stack.md) for technology choices.
 The project uses a **DevContainer** for full isolation of dependencies from the host OS.
 See [ADR-001](docs/adr/ADR-001-devcontainer-isolation.md) for rationale.
 
-**Container engine:** Podman (whitelistable in Claude Code sandbox; Docker works too).
+**Container engine:** Docker.
 
 ### Starting the DevContainer
 
 ```bash
-devcontainer up --workspace-folder . --docker-path podman
+devcontainer up --workspace-folder .
 ```
 
 ### Running commands inside the DevContainer
 
 ```bash
-devcontainer exec --workspace-folder . --docker-path podman uv sync
-devcontainer exec --workspace-folder . --docker-path podman uv run pytest
-devcontainer exec --workspace-folder . --docker-path podman uv run mcp-standby-proxy serve -c config.yaml
+devcontainer exec --workspace-folder . uv sync
+devcontainer exec --workspace-folder . uv run pytest
+devcontainer exec --workspace-folder . uv run mcp-standby-proxy serve -c config.yaml
 ```
 
 ### Tearing down
 
 ```bash
-podman rm -f $(podman ps -aq --filter label=devcontainer.local_folder=$(pwd))
+docker rm -f $(docker ps -aq --filter label=devcontainer.local_folder=$(pwd))
 ```
 
 **All project commands (`uv sync`, `uv run pytest`, etc.) must be run inside the
@@ -92,7 +92,7 @@ Key operational rules for implementation:
 ### Conventional Commits
 
 - **Format:** `type(scope): description` — e.g. `feat(proxy): add request queuing
-  during Starting state`. Subject line under 72 characters.
+  during Starting state`. Subject line under 120 characters.
 - **Types:** `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`.
 - **Scopes:** Based on modules: `proxy`, `lifecycle`, `transport`, `config`, `cache`,
   `healthcheck`, `cli`, `idle`. Use `repo` for project-wide changes.
@@ -111,16 +111,18 @@ Key operational rules for implementation:
   `fix/healthcheck-timeout`.
 - **Git hooks:** `.githooks/` directory. Activate with `git config core.hooksPath .githooks`.
 
-### Docker / Podman
+### Docker
 
-- **Container engine:** Podman is the default. Use `--docker-path podman` with
-  `devcontainer` CLI. Docker works identically if preferred.
-- **DevContainer as canonical environment:** `.devcontainer/Dockerfile` defines the
-  dev image. `devcontainer.json` configures features, user, and lifecycle hooks.
-- **Multi-stage builds:** Separate dev, builder, and runtime stages.
+- **Container engine:** Docker. See [ADR-001](docs/adr/ADR-001-devcontainer-isolation.md)
+  for the rationale (rootless Podman + BuildKit fails apt in devcontainer builds,
+  and JetBrains IDE integration has Podman-specific issues).
+- **DevContainer as canonical environment:** `.devcontainer/devcontainer.json`
+  configures the base image, features, user, and lifecycle hooks. No custom
+  Dockerfile — features are composed from the DevContainer Features registry.
 - **Non-root user:** Created by `common-utils` feature (`devcontainer` user).
-- **Layer caching:** Copy `pyproject.toml` + `uv.lock` before source code.
-- **Clean up in the same layer:** Install + purge in a single `RUN`.
+- **Layer caching via features:** `overrideFeatureInstallOrder` pins the install
+  sequence so `common-utils` + `git` run before feature scripts that need
+  curl/file.
 
 ### Architecture Decision Records
 
