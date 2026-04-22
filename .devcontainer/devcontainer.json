@@ -27,9 +27,16 @@
       "version": "os-provided"
     }
   },
+  "overrideFeatureInstallOrder": [
+    "ghcr.io/devcontainers/features/common-utils",
+    "ghcr.io/devcontainers/features/git",
+  ],
   "remoteUser": "devcontainer",
   "containerEnv": {
     "UV_LINK_MODE": "copy"
   },
-  "postCreateCommand": "test -f pyproject.toml && uv sync || true"
+  "postCreateCommand": {
+    "uv-sync": "test -f pyproject.toml && uv sync || true",
+    "git-hooks": ["git", "config", "core.hooksPath", ".githooks"]
+  }
 }

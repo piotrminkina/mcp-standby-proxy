@@ -49,7 +49,10 @@ podman rm -f $(podman ps -aq --filter label=devcontainer.local_folder=$(pwd))
 ## Git hooks
 
 Local git hooks (including `gitlint` for conventional-commit validation) live
-in `.githooks/`. Activate them once after cloning:
+in `.githooks/`. The DevContainer activates them automatically on first
+creation (via `postCreateCommand`). Since `.git/config` lives inside the
+bind-mounted workspace, the setting is also visible to the host — you only
+need to do this manually if you skip the DevContainer:
 
 ```bash
 git config core.hooksPath .githooks
