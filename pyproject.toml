@@ -7,6 +7,11 @@ name = "mcp-standby-proxy"
 version = "0.1.0"
 description = "Lazy-start stdio proxy for MCP servers"
 requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Piotr Minkina", email = "piotrminkina@users.noreply.github.com" },
+]
 dependencies = [
   "mcp",
   "httpx",

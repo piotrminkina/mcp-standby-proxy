@@ -180,4 +180,27 @@ for technology choices, and [Tech Spec](docs/plans/tech-spec.md) for architectur
 
 ## License
 
-Not yet specified.
+Copyright (C) 2026 Piotr Minkina
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the
+Free Software Foundation, either version 3 of the License, or (at your
+option) any later version.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+Public License for more details.
+
+Full license text: [`LICENSE`](LICENSE) or <https://www.gnu.org/licenses/gpl-3.0.html>.
+
+### Why GPLv3
+
+`mcp-standby-proxy` is a developer tool that sits between an MCP client and
+a backend. Both talk to the proxy through arms-length boundaries (stdin/stdout
+pipes, HTTP sockets) — under established FSF interpretation, using the proxy
+does NOT impose GPL on the MCP client, the backend, or anything else that
+merely communicates with it. GPLv3 covers only the proxy itself and any
+**derivative works** (forks, embedded copies). The intent is reciprocity: if
+you improve the proxy and distribute that improved version, those improvements
+stay open for everyone.
