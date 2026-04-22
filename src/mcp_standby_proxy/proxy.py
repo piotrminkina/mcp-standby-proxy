@@ -75,7 +75,7 @@ class ProxyRunner:
         writer = JsonRpcWriter(sys.stdout.buffer)
 
         def _transport_factory():
-            return create_transport(self._config.backend)
+            return create_transport(self._config.backend, cwd=self._config_dir)
 
         router = MessageRouter(
             config=self._config,

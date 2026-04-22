@@ -1,9 +1,9 @@
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from mcp_standby_proxy.config import BackendConfig, BackendTransport as BackendTransportEnum
-from mcp_standby_proxy.errors import ConfigError
 from mcp_standby_proxy.transport import BackendTransport, create_transport
 
 
@@ -32,30 +32,34 @@ def test_concrete_class_satisfies_protocol() -> None:
     assert transport.is_connected() is False
 
 
-def test_create_transport_streamable_http_returns_streamable_http_transport() -> None:
+def test_create_transport_streamable_http_returns_streamable_http_transport(
+    tmp_path: Path,
+) -> None:
     config = BackendConfig(
         transport=BackendTransportEnum.STREAMABLE_HTTP,
         url="http://localhost:8080/mcp",
     )
     from mcp_standby_proxy.transport.streamable_http import StreamableHttpTransport
-    transport = create_transport(config)
+    transport = create_transport(config, cwd=tmp_path)
     assert isinstance(transport, StreamableHttpTransport)
 
 
-def test_create_transport_stdio_raises_config_error() -> None:
+def test_create_transport_stdio_returns_stdio_transport(tmp_path: Path) -> None:
     config = BackendConfig(
         transport=BackendTransportEnum.STDIO,
         command="npx",
+        args=["some-mcp-server"],
     )
-    with pytest.raises(ConfigError, match="not implemented"):
-        create_transport(config)
+    from mcp_standby_proxy.transport.stdio import StdioTransport
+    transport = create_transport(config, cwd=tmp_path)
+    assert isinstance(transport, StdioTransport)
 
 
-def test_create_transport_sse_returns_sse_transport() -> None:
+def test_create_transport_sse_returns_sse_transport(tmp_path: Path) -> None:
     config = BackendConfig(
         transport=BackendTransportEnum.SSE,
         url="http://localhost:5090/sse",
     )
     from mcp_standby_proxy.transport.sse import SseTransport
-    transport = create_transport(config)
+    transport = create_transport(config, cwd=tmp_path)
     assert isinstance(transport, SseTransport)

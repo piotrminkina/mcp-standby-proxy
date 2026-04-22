@@ -1,14 +1,16 @@
+from pathlib import Path
+
 from mcp_standby_proxy.config import BackendConfig, BackendTransport as BackendTransportEnum
-from mcp_standby_proxy.errors import ConfigError
 from mcp_standby_proxy.transport.base import BackendTransport
 
 __all__ = ["BackendTransport", "create_transport"]
 
 
-def create_transport(config: BackendConfig) -> BackendTransport:
+def create_transport(config: BackendConfig, cwd: Path) -> BackendTransport:
     """Create transport based on config.backend.transport.
 
-    SSE and Streamable HTTP are supported. Raises ConfigError for unsupported transports.
+    SSE and Streamable HTTP are supported. For stdio, spawns a child process
+    in the given working directory.
     """
     if config.transport == BackendTransportEnum.SSE:
         from mcp_standby_proxy.transport.sse import SseTransport
@@ -20,7 +22,14 @@ def create_transport(config: BackendConfig) -> BackendTransport:
         assert config.url is not None
         return StreamableHttpTransport(config.url)
 
-    raise ConfigError(
-        f"Transport '{config.transport.value}' is not implemented. "
-        "Only 'sse' and 'streamable_http' transports are supported."
-    )
+    if config.transport == BackendTransportEnum.STDIO:
+        from mcp_standby_proxy.transport.stdio import StdioTransport
+        assert config.command is not None
+        return StdioTransport(
+            command=config.command,
+            args=config.args,
+            env=config.env,
+            cwd=cwd,
+        )
+
+    raise AssertionError(f"Unhandled transport type: {config.transport!r}")  # pragma: no cover
