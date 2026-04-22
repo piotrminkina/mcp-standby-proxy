@@ -1,7 +1,7 @@
 # Product Requirements Document (PRD) — mcp-standby-proxy
 
-**Status:** PROPOSED
-**Date:** 2026-04-09
+**Status:** APPROVED (living document)
+**Date:** 2026-04-22
 **Related:** [Tech Stack](tech-stack.md) | [Tech Spec](tech-spec.md) | [Config Spec](config-spec.md)
 
 ---
@@ -58,6 +58,31 @@ intention of using those tools in the current session.
 
 ## 3. Functional Requirements
 
+### 3.0 Implementation status (as of 2026-04-22)
+
+| FR | Title | Phase | Status |
+|----|-------|-------|--------|
+| FR-1 | Cached schema serving | MVP | implemented |
+| FR-2 | Backend lifecycle management | MVP | implemented |
+| FR-3 | Request forwarding | MVP | implemented |
+| FR-4 | SSE backend transport | MVP | implemented |
+| FR-5 | Configuration | MVP | implemented |
+| FR-6 | State machine | MVP | implemented |
+| FR-7 | Streamable HTTP backend transport | post-MVP | implemented |
+| FR-8 | stdio backend transport | post-MVP | implemented (FR-8.3 timeouts pending — see below) |
+| FR-9 | Idle timeout with auto-shutdown | post-MVP | proposed |
+| FR-10 | Background schema refresh | post-MVP | proposed |
+| FR-11 | Standalone binary build | post-MVP | proposed |
+| FR-12 | Config validation CLI | post-MVP | proposed |
+| FR-13 | Cache pre-warm CLI | post-MVP phase 1 | proposed |
+| FR-14 | Progress notifications during cold start | post-MVP phase 1 | proposed (needs spike) |
+| FR-15 | Startup cleanup check | post-MVP phase 1 | proposed |
+| FR-16 | Cache age warning | post-MVP phase 1 | proposed |
+| FR-17 | Client capability forwarding | post-MVP phase 1 | proposed |
+| FR-18 | Server-to-client request forwarding | post-MVP | proposed |
+| FR-19 | Stderr logging contract | MVP | implemented |
+| FR-20 | MCP protocol version handling | MVP | implemented (pass-through) |
+
 ### FR-1: Cached schema serving (MVP)
 
 The proxy must serve `tools/list` responses from a local JSON cache file without
@@ -108,8 +133,18 @@ The proxy must manage the backend's lifecycle through configurable shell command
   command (exits 0).
 - FR-2.4: Configurable timeouts: start command timeout, healthcheck interval,
   healthcheck max attempts, healthcheck per-attempt timeout.
-- FR-2.5: On SIGTERM **or stdin EOF** (pipe closed by MCP client), proxy gracefully stops the backend (executes stop command) if it is currently running, then exits.
-- FR-2.6: The proxy assumes that the start command is idempotent (running start when already started is a no-op or fast return). This is the user's responsibility. Document as a configuration requirement.
+- FR-2.5: On SIGTERM **or stdin EOF** (pipe closed by MCP client), proxy gracefully
+  stops the backend (executes stop command) if it is currently running, then exits.
+- FR-2.6: **Start command idempotency is the user's responsibility.** Running `start`
+  when the backend is already active must be a no-op or fast return. The proxy does
+  not short-circuit based on its own state — the command runs, and the healthcheck
+  decides readiness. Document as a configuration requirement in config-spec.md.
+- FR-2.7: **Stop command failures are non-fatal.** If the stop command exits non-zero
+  or times out, the proxy logs a warning and transitions to `Cold` anyway. Stop
+  idempotency is NOT required from the user — a failing stop leaves the backend in
+  an unknown state, and the next start attempt handles cleanup (if healthcheck passes
+  immediately, restart is fast; if not, start command runs and the user's idempotency
+  contract covers it).
 
 ### FR-3: Request forwarding (MVP)
 
@@ -118,8 +153,9 @@ The proxy must forward `tools/call` requests to the live backend and return resp
 **Sub-requirements:**
 - FR-3.1: After backend reaches Active state, proxy forwards `tools/call` JSON-RPC
   requests to the backend via the configured transport.
-- FR-3.2: Proxy remaps JSON-RPC `id` fields to avoid collisions between client and
-  proxy-originated requests (initialize, schema refresh).
+- FR-3.2: Proxy remaps JSON-RPC `id` fields to avoid collisions between client-originated
+  and proxy-originated requests (initialize, schema refresh). **When FR-18 is enabled,
+  this extends to server-originated IDs — see FR-18.6.**
 - FR-3.3: Multiple concurrent `tools/call` requests must be supported (the MCP client
   sends them in parallel).
 - FR-3.4: Requests arriving while backend is starting are queued and forwarded once
@@ -135,7 +171,9 @@ The proxy must communicate with SSE-based MCP backends.
 - FR-4.1: Connect to SSE endpoint (GET), receive `endpoint` event with POST URL.
 - FR-4.2: Perform MCP `initialize` handshake with the backend over SSE.
 - FR-4.3: Forward `tools/call` via POST to the SSE message endpoint, receive response.
-- FR-4.4: Detect transport disconnection and transition to Failed state.
+- FR-4.4: Detect transport disconnection and transition to Failed state. No
+  auto-reconnection in v1 (see §4 out of scope). Next client request triggers a
+  fresh connect via the normal Failed → Cold → Starting path.
 
 ### FR-5: Configuration (MVP)
 
@@ -172,8 +210,12 @@ The proxy must implement a deterministic backend lifecycle state machine.
 - FR-6.4: Starting/Healthy → Failed: timeout or error. After cooldown → Cold.
 - FR-6.5: Active → Stopping: idle timeout (post-MVP) or SIGTERM.
 - FR-6.6: Stopping → Cold: stop command complete.
-- FR-6.7: Stopping + `tools/call` received → queue the request. Stop command runs to completion. After stop completes (Cold), immediately transition to Starting. Queued request is processed via the normal cold-start path.
-- FR-6.8: Multiple requests arriving during any transitional state (Starting, Stopping) are queued. State transitions are serialized — no concurrent transitions. Queued requests are drained on terminal states (Active: forward all, Failed: error all).
+- FR-6.7: Stopping + `tools/call` received → queue the request. Stop command runs to
+  completion. After stop completes (Cold), immediately transition to Starting.
+  Queued request is processed via the normal cold-start path.
+- FR-6.8: Multiple requests arriving during any transitional state (Starting, Stopping)
+  are queued. State transitions are serialized — no concurrent transitions. Queued
+  requests are drained on terminal states (Active: forward all, Failed: error all).
 
 ### FR-7: Streamable HTTP backend transport (post-MVP)
 
@@ -182,21 +224,38 @@ Support for HTTP Streamable MCP backends.
 - FR-7.1: POST JSON-RPC to configured URL.
 - FR-7.2: Handle both direct JSON and SSE response modes.
 - FR-7.3: Session ID tracking (`Mcp-Session-Id` header).
+- FR-7.4: Same disconnect handling as FR-4.4. No auto-reconnection in v1.
 
 ### FR-8: stdio backend transport (post-MVP)
 
 Support for stdio-based MCP backends with separate infrastructure lifecycle.
 
-- FR-8.1: Two-phase start: infrastructure (lifecycle.start) then child process
-  (backend.command).
-- FR-8.2: Manage child process lifecycle (spawn, stdin/stdout pipes, graceful
-  shutdown: close stdin → wait → SIGTERM → SIGKILL).
+- FR-8.1: Two-phase start: infrastructure (`lifecycle.start`) then child process
+  (`backend.command`). Satisfied by construction — `lifecycle.start` + healthcheck
+  complete before transport connect, which is where the child process spawns.
+- FR-8.2: Manage child process lifecycle: spawn, stdin/stdout pipes, graceful
+  shutdown (close stdin → wait → SIGTERM → SIGKILL). Child process is spawned in a
+  new session (`start_new_session=True`) so signals are delivered to the whole
+  process group.
+- FR-8.3: **Shutdown timeouts are fixed in v1: 10 seconds between `close(stdin)`
+  and SIGTERM, and 10 seconds between SIGTERM and SIGKILL.** Not user-configurable.
+  Rationale: well-behaved MCP servers exit on stdin close within single-digit
+  seconds; 10s is lenient enough for GC/finalizer-heavy runtimes (JVM, Node with
+  large caches) without holding up SIGTERM-driven proxy shutdown indefinitely.
+  **Implementation note (as of 2026-04-22):** current implementation inherits the
+  MCP SDK's 2s/2s timeouts. Extending to 10s/10s is tracked as follow-up work
+  (either wrap the SDK's `stdio_client` shutdown or run our own termination
+  sequence after exiting the SDK context).
+- FR-8.4: Stdout frames exchanged through the child process pipes. Stderr is
+  pass-through to the proxy's stderr — no capture, no prefixing (see FR-19).
 
 ### FR-9: Idle timeout with auto-shutdown (post-MVP)
 
 - FR-9.1: Configurable idle timeout per instance (seconds since last `tools/call`).
 - FR-9.2: On idle timeout: close transport, execute stop command, transition to Cold.
-- FR-9.3: `tools/call` during Stopping → queue the request. Stop command runs to completion. After stop completes (Cold), immediately transition to Starting. Queued request is processed via the normal cold-start path.
+- FR-9.3: `tools/call` during Stopping → queue the request. Stop command runs to
+  completion. After stop completes (Cold), immediately transition to Starting. Queued
+  request is processed via the normal cold-start path.
 
 ### FR-10: Background schema refresh (post-MVP)
 
@@ -206,6 +265,55 @@ Support for stdio-based MCP backends with separate infrastructure lifecycle.
 - FR-10.3: Send `notifications/tools/list_changed` to client so it re-fetches.
 - FR-10.4: Extend to `resources/list`, `prompts/list` if backend declares those
   capabilities.
+
+### FR-11: Standalone binary build (post-MVP)
+
+- FR-11.1: Build pipeline that compiles the proxy to a standalone native binary.
+- FR-11.2: Binary has zero runtime dependencies (no interpreter required on host).
+- FR-11.3: Fallback: standard package install works identically.
+
+### FR-12: Config validation CLI (post-MVP)
+
+- FR-12.1: `mcp-standby-proxy validate -c config.yaml` subcommand.
+- FR-12.2: Validates YAML syntax, required fields, transport-specific constraints.
+- FR-12.3: Warns if cache file is missing (proxy will bootstrap it).
+
+### FR-13: Cache pre-warm CLI (post-MVP phase 1)
+
+- FR-13.1: `mcp-standby-proxy warm -c config.yaml` subcommand that starts the
+  backend, fetches all capabilities, writes the cache file, stops the backend, and exits.
+- FR-13.2: Non-interactive batch command (no stdio proxy loop), meant to be run before
+  the first session.
+- FR-13.3: Exits 0 on success (cache written), 1 on failure (with diagnostic on stderr).
+
+### FR-14: Progress notifications during cold start (post-MVP phase 1)
+
+Prerequisite: spike to verify MCP client displays `notifications/message`. Drop if not
+displayed.
+
+- FR-14.1: While backend is starting and requests are queued, proxy sends periodic
+  `notifications/message` to the client with status updates (e.g., "Starting
+  backend...", "Healthcheck attempt 3/60...").
+- FR-14.2: Keeps the connection alive and gives the user visibility into startup
+  progress.
+
+### FR-15: Startup cleanup check (post-MVP phase 1)
+
+- FR-15.1: On startup, before entering the proxy loop, run the healthcheck once with
+  a short timeout to detect if the backend is already running (e.g., ghost from a
+  previous crashed session).
+- FR-15.2: If the backend is already running, proxy transitions directly to Healthy
+  (skip start command, connect transport immediately).
+- FR-15.3: Log a warning: "Backend already running — reusing existing instance."
+- FR-15.4: Proxy tracks whether it started the backend (`_proxy_started_backend`
+  flag). On shutdown, execute stop command only if the proxy started the backend.
+
+### FR-16: Cache age warning (post-MVP phase 1)
+
+- FR-16.1: On startup, if cache file exists and is older than a configurable threshold
+  (default: 7 days), log a warning to stderr: "Cache file is N days old. Consider
+  running `mcp-standby-proxy warm` to refresh."
+- FR-16.2: Informational only — proxy still serves from cache.
 
 ### FR-17: Client capability forwarding (post-MVP phase 1)
 
@@ -249,45 +357,51 @@ lost.
 - FR-18.4: Client responses to server-originated requests are forwarded back
   to the backend via the transport.
 - FR-18.5: Incoming backend notifications are forwarded to the client via stdout.
-- FR-18.6: ID remapping must prevent collisions between client-originated IDs,
-  proxy-originated IDs, and server-originated IDs.
+- FR-18.6: ID remapping must prevent collisions between **three** ID spaces:
+  client-originated, proxy-originated (initialize, schema refresh), and
+  server-originated. Extends FR-3.2.
 
-### FR-11: Standalone binary build (post-MVP)
+### FR-19: Stderr logging contract (MVP)
 
-- FR-11.1: Build pipeline that compiles the proxy to a standalone native binary.
-- FR-11.2: Binary has zero runtime dependencies (no interpreter required on host).
-- FR-11.3: Fallback: standard package install works identically.
+The proxy must log operational events to stderr in a format compatible with
+service managers that capture stderr (systemd-journald, Docker log driver,
+shell redirection).
 
-### FR-12: Config validation CLI (post-MVP)
+- FR-19.1: Stderr is the **only** log output. No file handlers, no network
+  syslog, no structured telemetry export in v1.
+- FR-19.2: Log format: `timestamp level [server_name] message`. Timestamp in
+  ISO-8601 local time. Server name taken from `server.name` in config.
+- FR-19.3: Log levels: WARNING (default), INFO (`-v`), DEBUG (`-vv`).
+- FR-19.4: Client-side transport (stdin/stdout) is JSON-RPC only — **no log
+  output may ever appear on stdout**. Violating this would corrupt the JSON-RPC
+  stream to the MCP client. This is a hard invariant enforced by the logger
+  configuration.
+- FR-19.5: For stdio backend transport, the child process's stderr is
+  pass-through to the proxy's stderr (no capture, no prefixing). Users get
+  interleaved proxy + backend logs on the same stream.
 
-- FR-12.1: `mcp-standby-proxy validate -c config.yaml` subcommand.
-- FR-12.2: Validates YAML syntax, required fields, transport-specific constraints.
-- FR-12.3: Warns if cache file is missing (proxy will bootstrap it).
+### FR-20: MCP protocol version handling (MVP)
 
-### FR-13: Cache pre-warm CLI (post-MVP phase 1)
+The proxy is a thin pass-through — it does not enforce MCP protocol version
+compatibility between client and backend. The version negotiation happens
+directly between the two via `initialize`; the proxy only participates in its
+own `initialize` response to the client.
 
-- FR-13.1: `mcp-standby-proxy warm -c config.yaml` subcommand that starts the backend, fetches all capabilities, writes the cache file, stops the backend, and exits.
-- FR-13.2: Non-interactive batch command (no stdio proxy loop), meant to be run before the first session.
-- FR-13.3: Exits 0 on success (cache written), 1 on failure (with diagnostic on stderr).
-
-### FR-14: Progress notifications during cold start (post-MVP phase 1)
-
-Prerequisite: spike to verify MCP client displays `notifications/message`. Drop if not displayed.
-
-- FR-14.1: While backend is starting and requests are queued, proxy sends periodic `notifications/message` to the client with status updates (e.g., "Starting backend...", "Healthcheck attempt 3/60...").
-- FR-14.2: Keeps the connection alive and gives the user visibility into startup progress.
-
-### FR-15: Startup cleanup check (post-MVP phase 1)
-
-- FR-15.1: On startup, before entering the proxy loop, run the healthcheck once with a short timeout to detect if the backend is already running (e.g., ghost from a previous crashed session).
-- FR-15.2: If the backend is already running, proxy transitions directly to Healthy (skip start command, connect transport immediately).
-- FR-15.3: Log a warning: "Backend already running — reusing existing instance."
-- FR-15.4: Proxy tracks whether it started the backend (`_proxy_started_backend` flag). On shutdown, execute stop command only if the proxy started the backend.
-
-### FR-16: Cache age warning (post-MVP phase 1)
-
-- FR-16.1: On startup, if cache file exists and is older than a configurable threshold (default: 7 days), log a warning to stderr: "Cache file is N days old. Consider running `mcp-standby-proxy warm` to refresh."
-- FR-16.2: Informational only — proxy still serves from cache.
+- FR-20.1: On `initialize` from the client, proxy echoes the client's
+  `protocolVersion` field in the `result.protocolVersion`, or substitutes the
+  proxy's internally known version if the client didn't declare one.
+- FR-20.2: When initializing the backend connection, the proxy uses its
+  internally known `protocolVersion`. If the backend responds with a different
+  version, the proxy logs a warning but does not fail — the backend's version
+  is what actually serves `tools/call`, so downstream behaviour is the backend's
+  responsibility.
+- FR-20.3: If the client's declared version is incompatible with the backend's,
+  the proxy does NOT block the session — tool calls may fail, but the failure
+  mode is the backend's (returning errors) not the proxy's. Rationale: proxy
+  transparency; version enforcement belongs in the client or the backend, not
+  in a relay.
+- FR-20.4: Proxy version advertised in its own `serverInfo` is the MCP SDK's
+  current protocol constant. Updated only when the SDK is upgraded.
 
 ## 4. Project Scope Boundaries
 
@@ -303,6 +417,8 @@ Prerequisite: spike to verify MCP client displays `notifications/message`. Drop 
 - SIGTERM graceful shutdown
 - stdin EOF as shutdown signal
 - Config with auto-generated schema
+- Stderr logging contract (FR-19)
+- MCP protocol version pass-through (FR-20)
 
 ### In scope (post-MVP phase 1)
 
@@ -316,25 +432,32 @@ Quality-of-life improvements. Build after MVP is proven in real sessions.
 
 ### In scope (post-MVP)
 
-- Streamable HTTP backend transport
-- stdio backend transport (child process + separate infrastructure)
-- Idle timeout with auto-shutdown
-- Background schema refresh + `notifications/*/list_changed`
-- Generic capability caching (`resources/list`, `prompts/list`)
+- Streamable HTTP backend transport — FR-7 *(implemented)*
+- stdio backend transport (child process + separate infrastructure) — FR-8 *(implemented; FR-8.3 timeouts pending)*
+- Idle timeout with auto-shutdown — FR-9
+- Background schema refresh + `notifications/*/list_changed` — FR-10
+- Generic capability caching (`resources/list`, `prompts/list`) — FR-1.4
 - Server-to-client request forwarding (bidirectional proxy) — FR-18
-- Standalone binary distribution
-- `validate` CLI subcommand
+- Standalone binary distribution — FR-11
+- `validate` CLI subcommand — FR-12
 
 ### Out of scope
 
-- Multiplexing multiple backends behind one proxy
-- HTTP/SSE server on the client side (proxy is stdio-only)
-- Authentication / authorization (config is trusted input)
-- Config hot-reload (restart proxy to pick up changes)
-- JSON-RPC batch support (the MCP client does not use it)
-- Standalone process management with PID files (future consideration)
-- GUI or web dashboard
-- Metrics / telemetry export (logs on stderr are sufficient)
+Permanent non-goals (not "post-MVP"; not on the roadmap):
+
+- Multiplexing multiple backends behind one proxy.
+- HTTP/SSE server on the client side (proxy is stdio-only).
+- Authentication / authorization (config is trusted input).
+- Config hot-reload (restart proxy to pick up changes).
+- **JSON-RPC batch support.** MCP clients (Claude Code, Cursor, etc.) do not
+  emit batched requests, and the MCP SDK does not generate them. YAGNI.
+- Standalone process management with PID files.
+- GUI or web dashboard.
+- Metrics / telemetry export (stderr logs are sufficient; see FR-19).
+- **Auto-reconnection on transport flaps.** The current Failed → cooldown → Cold
+  → restart-on-next-call pattern covers the common case; MCP clients retry
+  failed requests, so a brief disconnect manifests as one extra round-trip. If
+  production usage proves this insufficient, promote to a post-MVP feature then.
 
 ## 5. User Stories
 
@@ -365,7 +488,8 @@ Acceptance criteria:
 - Proxy polls healthcheck until backend is ready.
 - Proxy connects to backend via SSE, performs MCP handshake.
 - Proxy forwards the `tools/call` and returns the response.
-- Total time from `tools/call` to response = backend startup time + backend processing time + <100ms proxy overhead.
+- Total time from `tools/call` to response = backend startup time + backend processing
+  time + <100ms proxy overhead.
 
 ---
 
@@ -431,9 +555,11 @@ configure the backend connection and lifecycle commands.
 
 Acceptance criteria:
 - Config file is passed via `-c` / `--config` CLI argument.
-- Invalid config (missing required fields, wrong types) → clear error message on stderr with field path.
+- Invalid config (missing required fields, wrong types) → clear error message on
+  stderr with field path.
 - Config schema can be derived from the internal data model programmatically.
-- Example config file provided for SSE backend (MVP transport). Additional examples for HTTP and stdio backends added when those transports are implemented.
+- Example configs for SSE, Streamable HTTP, and stdio backends are provided under
+  `examples/` in the repo.
 
 ---
 
@@ -443,12 +569,11 @@ As a developer registering the proxy in the MCP client, I want a simple MCP serv
 entry that replaces the direct backend entry.
 
 Acceptance criteria:
-- MCP client config entry:
-  ```json
-  {"command": "/path/to/mcp-standby-proxy", "args": ["serve", "-c", "/path/to/backend.yaml"]}
-  ```
+- MCP client config entry points at the proxy binary with `serve -c <config path>`
+  (exact syntax documented in `README.md` and `examples/*.yaml`).
 - All tools previously available via direct backend connection remain available.
-- Tool call results are identical to direct connection (pass-through, no transformation).
+- Tool call results are identical to direct connection (pass-through, no
+  transformation).
 
 ---
 
@@ -456,10 +581,12 @@ Acceptance criteria:
 
 **US-009: Cache pre-warm**
 
-As a developer setting up the proxy for the first time, I want to pre-build the cache before my first session so that the first session starts instantly.
+As a developer setting up the proxy for the first time, I want to pre-build the cache
+before my first session so that the first session starts instantly.
 
 Acceptance criteria:
-- `mcp-standby-proxy warm -c config.yaml` starts the backend, fetches tool schemas, writes cache, stops backend.
+- `mcp-standby-proxy warm -c config.yaml` starts the backend, fetches tool schemas,
+  writes cache, stops backend.
 - Command exits 0 on success with a message indicating cache path and tool count.
 - Command exits 1 on failure with diagnostic information.
 - After warm, next `mcp-standby-proxy serve` session serves tools instantly from cache.
@@ -468,7 +595,8 @@ Acceptance criteria:
 
 **US-010: Orphan backend detection**
 
-As a developer whose previous session crashed, I want the proxy to detect and reuse the still-running backend instead of failing or starting a duplicate.
+As a developer whose previous session crashed, I want the proxy to detect and reuse
+the still-running backend instead of failing or starting a duplicate.
 
 Acceptance criteria:
 - Proxy starts, runs healthcheck, detects backend is already running.
@@ -486,7 +614,8 @@ the backend to stop automatically after a configurable period of inactivity.
 Acceptance criteria:
 - No `tools/call` for `idle_timeout` seconds → proxy executes stop command.
 - Next `tools/call` after shutdown triggers a clean restart (Cold → Starting → Active).
-- `tools/call` during Stopping is queued. Stop completes, then backend restarts. Queued request is forwarded after Active.
+- `tools/call` during Stopping is queued. Stop completes, then backend restarts.
+  Queued request is forwarded after Active.
 
 ---
 
@@ -535,8 +664,10 @@ infrastructure lifecycle and the MCP server process.
 
 Acceptance criteria:
 - Proxy starts infrastructure (lifecycle.start), waits for healthcheck.
-- Proxy spawns the MCP server child process (backend.command) after infrastructure is ready.
-- On shutdown: closes child process first, then stops infrastructure.
+- Proxy spawns the MCP server child process (backend.command) after infrastructure
+  is ready.
+- On shutdown: closes child process first (close stdin → wait 10s → SIGTERM → wait
+  10s → SIGKILL), then stops infrastructure.
 
 ---
 
@@ -549,6 +680,17 @@ Acceptance criteria:
 - `mcp-standby-proxy` binary runs without an interpreter installed on the host.
 - Binary size < 15MB.
 - Functionality identical to `uv run mcp-standby-proxy`.
+
+---
+
+**US-017: Config validation CLI**
+
+As a developer creating a new config, I want to validate it before running the proxy.
+
+Acceptance criteria:
+- `mcp-standby-proxy validate -c config.yaml` exits 0 if valid, 1 if errors.
+- Error messages include field path and expected type/value.
+- Warning if cache file does not exist (not an error — proxy will bootstrap it).
 
 ---
 
@@ -583,18 +725,9 @@ Acceptance criteria:
 - Round-trip latency < 100ms proxy overhead.
 - Server-originated notifications from backend are forwarded to client.
 
----
-
-**US-017: Config validation CLI**
-
-As a developer creating a new config, I want to validate it before running the proxy.
-
-Acceptance criteria:
-- `mcp-standby-proxy validate -c config.yaml` exits 0 if valid, 1 if errors.
-- Error messages include field path and expected type/value.
-- Warning if cache file does not exist (not an error — proxy will bootstrap it).
-
 ## 6. Success Metrics
+
+### 6.1 MVP metrics
 
 | Metric | Target | How to measure |
 |--------|--------|----------------|
@@ -605,6 +738,23 @@ Acceptance criteria:
 | Proxy routing latency (Active state) | < 100ms | Compare `tools/call` round-trip through proxy vs. direct connection to same backend |
 | RAM savings vs direct connection | > 90% | ~25MB proxy vs ~300-500MB typical backend stack when idle |
 | Backend stop on session end | 100% | Verify no backend processes after MCP client exit (SIGTERM path) |
+| stdout contamination | 0 bytes of non-JSON-RPC | `stdout | jq -c .` must never fail on a line (FR-19.4) |
+
+### 6.2 Post-MVP metrics
+
+Targets to verify when each respective feature ships.
+
+| Feature | Metric | Target |
+|---------|--------|--------|
+| FR-9 Idle timeout | Time from last `tools/call` to Cold | `idle_timeout + stop_duration ± 2s` |
+| FR-10 Schema refresh | `list_changed` false-positive rate | 0 (only fire when cache actually differs) |
+| FR-10 Schema refresh | Notification latency after backend change | < 5s from Active transition |
+| FR-13 Warm CLI | End-to-end time for typical backend | < 60s cold, < 10s warm |
+| FR-15 Orphan detection | Detection accuracy | 100% (no duplicate spawn when backend alive) |
+| FR-17 Capability forwarding | Backend warning rate for missing capabilities | 0 when client declared capabilities |
+| FR-18 Bidi forwarding | Server→client→server round-trip overhead | < 100ms proxy-added latency |
+| FR-8.3 Shutdown timeouts | stdio backend shutdown duration on cooperating backend | < 3s (SIGTERM path not reached) |
+| FR-8.3 Shutdown timeouts | stdio backend shutdown duration on unresponsive backend | < 22s (10s + 10s + kill) |
 
 ## 7. Risks & Challenges
 
@@ -612,15 +762,20 @@ Acceptance criteria:
 |------|----------|------------|------------|
 | MCP SDK too opinionated for proxy pattern | Medium | Low | Hybrid approach: raw stdio client-side, SDK transports backend-side. Fallback to raw HTTP client if SDK transport is too rigid. |
 | Binary compilation breaks on specific dependency | Low | Low | Fallback to standard package distribution. Post-MVP concern. |
-| MCP protocol evolution breaks proxy | Low | Low | Proxy is thin pass-through — protocol changes affect transport layer only. SDK tracks protocol changes. |
+| MCP protocol evolution breaks proxy | Low | Low | Proxy is thin pass-through (FR-20) — protocol changes affect transport layer only. SDK tracks protocol changes. |
 | MCP clients change startup behavior (stop probing `tools/list`) | Low | Very Low | Proxy is still useful as resource manager (idle shutdown). Monitor MCP ecosystem. |
-| SSE reconnection edge cases (network flaps, timeouts) | Medium | Medium | Use SDK's battle-tested SSE transport. Test against real backends on unstable connections. |
+| SSE reconnection edge cases (network flaps, timeouts) | Medium | Medium | Auto-reconnect explicitly out of scope v1 (see §4); rely on MCP client retry behaviour. Revisit if production usage proves insufficient. |
 | Concurrent `tools/call` race conditions in state machine | Medium | Medium | Careful async locking. State transitions protected by async lock primitives. Comprehensive integration tests. |
 | MCP client timeouts on `tools/list` during cold bootstrap | High | High (first run) | FR-13 warm CLI pre-builds cache. FR-14 progress notifications keep connection alive. Document client-side timeout configuration. |
 | Proxy receives SIGKILL (client crash) — backend left running | Medium | Medium | FR-15 startup cleanup detects and reuses orphan backends. Idle timeout (post-MVP) limits orphan lifetime. |
 | Cache format incompatibility after proxy upgrade | Low | Low | FR-1.5 cache versioning. Invalid cache is deleted and rebuilt via cold bootstrap. |
 | Backend features degraded due to missing client capabilities | Medium | High | Proxy sends empty capabilities, backend cannot use `roots/list`, `sampling/createMessage`. FR-17 fixes this. FR-18 adds full bidirectional support. |
 | Server-to-client requests silently dropped | Medium | Medium | Transport read loop only matches response IDs, discards server-initiated messages. FR-18 introduces background reader task and forwarding. |
+| stdio backend with long GC pause on SIGTERM | Low | Medium | FR-8.3 10s+10s timeouts tolerate most JVM/Node shutdowns. SIGKILL fallback bounds worst case. |
+| Stdout contamination corrupts JSON-RPC stream | High | Low | FR-19.4 hard invariant: stderr-only logging. Enforced by log handler configuration; regression risk on new code paths. |
+| **OSS publication — unsolicited issue triage load** | Low | Medium | Document expectations in README (personal tool, best-effort support). Add issue templates. |
+| **OSS publication — supply chain via lifecycle.command** | Medium | Low | Config is trusted input (§8). Warn users in README that YAML files downloaded from third parties can execute arbitrary commands at `lifecycle.start` time. |
+| **OSS publication — security disclosure process** | Low | Low | `SECURITY.md` with contact method and response-time expectations. |
 
 ## 8. Technical Constraints
 
@@ -628,8 +783,10 @@ Acceptance criteria:
 |------------|--------|
 | **Client transport is always stdio.** MCP clients spawn servers as subprocesses. | Proxy cannot expose HTTP/SSE on the client side. All client communication is stdin/stdout JSON-RPC. |
 | **One proxy instance per MCP server.** Not a multiplexer. | Each backend needs its own config YAML and proxy process. Simple model, but N backends = N processes. |
-| **Config is trusted input.** Lifecycle commands are arbitrary shell commands from YAML. | No sandboxing or command validation beyond schema. Acceptable for personal tool. Document if OSS. |
-| **No JSON-RPC batch support (v1).** | If an MCP client sends batched requests, proxy rejects them with an error. Add in v2. |
+| **Config is trusted input.** Lifecycle commands are arbitrary shell commands from YAML. | No sandboxing or command validation beyond schema. Acceptable for personal tool. Documented in README for OSS users — YAML files from untrusted sources must not be run. |
+| **No JSON-RPC batch support.** | If an MCP client sends batched requests, proxy rejects them with an error. Permanent non-goal (§4). |
 | **Interpreter runtime required (MVP).** Standalone binary is post-MVP. | MVP requires a compatible runtime on host (or a version manager that provides it). |
-| **Logs on stderr only.** No structured telemetry export. | Compatible with service managers that capture stderr. Sufficient for personal tool. |
+| **Logs on stderr only.** No structured telemetry export. | Compatible with service managers that capture stderr (systemd-journald, Docker log driver). Sufficient for personal tool. FR-19.4 makes stdout-contamination a hard invariant. |
 | **Cache invalidation is manual (MVP).** Delete cache file + restart proxy. `warm` command available in post-MVP phase 1. | Users must remember to manually invalidate cache after backend updates. No automatic detection of tool changes until schema refresh (post-MVP). |
+| **MCP protocol version not enforced by proxy (FR-20).** | Mismatched client/backend versions surface as backend-side errors on tool calls, not proxy rejections. Version negotiation is between client and backend; proxy is transparent. |
+| **stdio shutdown timeouts fixed at 10s + 10s (FR-8.3).** | Not configurable in v1. Legitimate backends with >20s shutdown time (rare) would be SIGKILLed. Revisit if observed. |
