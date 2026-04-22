@@ -30,6 +30,7 @@ dev = [
   "ruff",
   "mypy",
   "uvicorn",
+  "gitlint",
 ]
 
 [tool.hatch.build.targets.wheel]

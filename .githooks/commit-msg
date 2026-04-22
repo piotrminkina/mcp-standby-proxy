@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if command -v gitlint &>/dev/null; then
+if command -v uv &>/dev/null && [ -f pyproject.toml ]; then
+    uv run --quiet gitlint --msg-filename "$1"
+elif command -v gitlint &>/dev/null; then
     gitlint --msg-filename "$1"
 fi
