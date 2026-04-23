@@ -467,9 +467,12 @@ introducing telemetry infrastructure.
   at startup: a missing-parent or permission error becomes a
   logged-to-stderr warning, the file channel is disabled for the process
   lifetime, and the proxy continues with stderr-only logging. To give the
-  user immediate feedback, the proxy emits an INFO line on stderr at
-  startup indicating the resolved log file path (e.g.,
-  `file logging enabled: path=/abs/path/to/kroki.log`).
+  user immediate feedback, the proxy writes a single informational line
+  **directly to `sys.stderr`** at startup (bypassing Python's `logging`
+  module so it appears regardless of `-v`/`-vv`): `file logging enabled: path=<absolute-path>`
+  (or `file logging disabled: <reason>` on failure, via the same direct
+  `sys.stderr.write` mechanism). Not a `logging.INFO` record — a one-shot
+  lifecycle announcement.
 - FR-21.6: File logging failures must never crash the proxy or interrupt the
   stdin/stdout JSON-RPC loop.
   - **Startup (handler construction) failures** — permission denied,
@@ -699,8 +702,9 @@ Acceptance criteria:
 - A misconfigured path (unwritable directory, permission denied, non-existent
   parent that cannot be mkdir'd) produces a single stderr warning and does
   not prevent the proxy from running; stderr-only logging continues.
-- A resolved log file path is announced on stderr at startup (INFO line) so
-  the user sees where logs actually land.
+- A resolved log file path is announced on stderr at startup via a direct
+  `sys.stderr.write` (not a `logging.INFO` record, so it appears regardless
+  of `-v`/`-vv`). Exact format: `file logging enabled: path=<absolute-path>`.
 
 ---
 

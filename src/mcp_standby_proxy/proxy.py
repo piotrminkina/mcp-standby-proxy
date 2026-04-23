@@ -87,13 +87,14 @@ def _setup_logging(
             rotating_handler.setLevel(file_level)
             rotating_handler.setFormatter(formatter)
             root.addHandler(rotating_handler)
-            # Print directly to stderr — bypasses the handler level filter so the
-            # path is always visible regardless of the -v flag (FR-21.5).
-            print(f"file logging enabled: path={resolved_log_path}", file=sys.stderr)
+            # Write directly to stderr, bypassing the logging module entirely,
+            # so the path announcement appears regardless of -v/-vv (FR-21.5).
+            sys.stderr.write(f"file logging enabled: path={resolved_log_path}\n")
+            sys.stderr.flush()
         except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "file logging disabled: %s", exc
-            )
+            # Same direct write so the degradation notice is never filtered (FR-21.6).
+            sys.stderr.write(f"file logging disabled: {exc}\n")
+            sys.stderr.flush()
 
     root.setLevel(effective_root_level)
 

@@ -186,18 +186,34 @@ def test_file_logging_disabled_on_permission_error(tmp_path, capsys) -> None:
 
 
 def test_file_logging_enabled_info_on_stderr(tmp_path, capsys) -> None:
-    """Startup path announcement always appears on stderr regardless of -v flag (FR-21.5).
+    """Startup path announcement appears on stderr unconditionally (FR-21.5).
 
-    Uses verbose=0 (WARNING stderr) to cover the production case: the announcement
-    must bypass the stderr handler level filter and reach stderr unconditionally.
+    verbose=0 keeps the stderr handler at WARNING — the announcement must still
+    appear, proving it bypasses Python's logging module entirely.
     """
     log_path = tmp_path / "proxy.log"
     log_file_config = LoggingFileConfig(path=str(log_path), level="info")
     _setup_logging("myserver", verbose=0, log_file_config=log_file_config, resolved_log_path=log_path)
 
     captured = capsys.readouterr()
-    assert "file logging enabled" in captured.err
-    assert str(log_path) in captured.err
+    assert f"file logging enabled: path={log_path}\n" in captured.err
+
+
+def test_file_logging_disabled_notice_on_stderr(tmp_path, capsys) -> None:
+    """Degradation notice appears on stderr unconditionally (FR-21.6).
+
+    verbose=0 — the notice must appear even when stderr handler is at WARNING.
+    """
+    log_path = tmp_path / "proxy.log"
+    log_file_config = LoggingFileConfig(path=str(log_path), level="info")
+
+    tmp_path.chmod(0o555)
+    try:
+        _setup_logging("myserver", verbose=0, log_file_config=log_file_config, resolved_log_path=log_path)
+        captured = capsys.readouterr()
+        assert "file logging disabled:" in captured.err
+    finally:
+        tmp_path.chmod(0o755)
 
 
 def test_no_file_handler_when_config_is_none(tmp_path) -> None:

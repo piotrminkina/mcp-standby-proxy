@@ -212,8 +212,11 @@ Cross-field constraints enforced at config load time (fail-fast):
    stderr (`file logging disabled: <reason>`) and the file channel is not
    installed; stderr-only logging continues. Rationale: an opt-in
    diagnostic channel must never block the proxy from running (FR-21.6).
-   For immediate feedback on the resolved path, the proxy emits an INFO
-   line on stderr at startup: `file logging enabled: path=<absolute-path>`.
+   For immediate feedback on the resolved path, the proxy writes a single
+   line **directly to `sys.stderr`** at startup (not via Python's `logging`
+   module — so it is visible regardless of `-v`/`-vv` level):
+   `file logging enabled: path=<absolute-path>`. On failure the line reads
+   `file logging disabled: <reason>` using the same direct-write mechanism.
 8. **Backup count lower bound:** `logging.file.backup_count` must be ≥ 1.
    Zero would make the size cap non-enforceable due to stdlib
    `RotatingFileHandler` behavior (see §3 `logging` parameter reference).
