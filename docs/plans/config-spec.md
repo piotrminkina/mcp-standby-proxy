@@ -21,6 +21,11 @@ All relative file paths in the configuration are resolved against the **config f
 parent directory** (`config_dir`). This applies to:
 
 - `cache.path` — resolved to `config_dir / cache.path` if not absolute.
+- `logging.file.path` — resolved to `config_dir / logging.file.path` if not
+  absolute. Intermediate directories are auto-created at startup, before
+  file handler construction. A resolved path that cannot be opened for
+  writing produces a single stderr warning; the proxy continues with
+  stderr-only logging (FR-21.5, FR-21.6).
 - `lifecycle.start` / `lifecycle.stop` — subprocess is spawned with `cwd=config_dir`.
 
 This rule ensures that a config file is self-contained and portable: moving the config
@@ -96,6 +101,16 @@ cache:
   # Auto-refresh cache when backend connects (compare live vs cached).
   # Ignored in MVP (FR-10 post-MVP).
   auto_refresh: true                          # bool, optional, default: true
+
+# Optional file logging — FR-21. Opt-in diagnostic channel for deployments
+# where stderr is captured by the parent process (e.g., Claude Code) and
+# not user-accessible. Absence of this entire section disables file logging.
+logging:
+  file:
+    path: "./kroki.log"                       # string, required within section — path to log file
+    level: info                               # enum: debug | info | warning | error | critical, default: info
+    max_size: "10MB"                          # size string (see grammar below), default: "10MB"
+    backup_count: 3                           # int, range: 1-100, default: 3
 ```
 
 ## 3. Parameter Reference
@@ -150,6 +165,24 @@ cache:
 | `cache.path` | string | — | yes | File path (absolute or relative to config file). Parent directory must exist after resolution. |
 | `cache.auto_refresh` | bool | `true` | no | Ignored in MVP. |
 
+### `logging`
+
+The entire `logging` section is optional — its absence disables file logging.
+When present, `logging.file` is the only supported sub-section in v1 (FR-21.1).
+
+| Parameter | Type | Default | Required | Validation |
+|-----------|------|---------|----------|------------|
+| `logging.file.path` | string | — | yes (if section present) | Non-empty. Relative paths resolve against `config_dir`. Parent directory auto-created at startup; open failure downgrades to stderr-only + warning (FR-21.5, FR-21.6). |
+| `logging.file.level` | enum | `info` | no | One of: `debug`, `info`, `warning`, `error`, `critical`. Independent of `-v`/`-vv` (FR-21.2). Default `info` covers lifecycle transitions and errors without payload bloat; raise to `debug` for active incident reproduction. |
+| `logging.file.max_size` | size string | `"10MB"` | no | Grammar: `<integer><unit>`, no spaces, case-sensitive. Accepted units: `B`, `KB`, `MB`, `GB` (decimal, 1 KB = 1000 B) and `KiB`, `MiB`, `GiB` (binary, 1 KiB = 1024 B). Range: 1 KB – 10 GB. Examples: `"10MB"`, `"500KB"`, `"2GiB"`. Rejects: `"10 MB"` (space), `"10mb"` (lowercase), bare integers, `"infinity"`. |
+| `logging.file.backup_count` | int | `3` | no | Range: **1–100**. Why not 0: stdlib `RotatingFileHandler` with `backupCount=0` *ignores* `max_size` (no rotation, file grows unbounded), making the size cap non-enforceable. Requiring ≥ 1 guarantees the size cap works as advertised. |
+
+**Rotation footprint.** Maximum disk usage for the file channel is approximately
+`max_size × (backup_count + 1)`. With defaults (10 MB × 4) the cap is 40 MB.
+The in-file size of the active segment can briefly exceed `max_size` by the
+size of a single log record (stdlib rotates *after* writing), so plan with
+a small margin.
+
 ## 4. Validation Rules
 
 Cross-field constraints enforced at config load time (fail-fast):
@@ -167,6 +200,23 @@ Cross-field constraints enforced at config load time (fail-fast):
 5. **Cache path parent:** `cache.path` is resolved against `config_dir` if relative.
    The resolved path's parent directory must exist at config load time. The cache file
    itself may not exist (cold bootstrap).
+6. **Logging section presence:** The `logging` top-level key is optional. If
+   present, `logging.file` must be present and `logging.file.path` must be
+   non-empty. Empty shells (`logging: {}` or `logging: { file: {} }`) are
+   configuration errors — reject at load time.
+7. **Logging file path (deferred open):** Unlike `cache.path`, the parent
+   directory of `logging.file.path` is **not** validated at config load
+   time. At startup, the proxy calls `mkdir -p` on the resolved parent and
+   constructs the rotating file handler. If that fails (permission denied,
+   read-only filesystem, invalid path), a single warning is written to
+   stderr (`file logging disabled: <reason>`) and the file channel is not
+   installed; stderr-only logging continues. Rationale: an opt-in
+   diagnostic channel must never block the proxy from running (FR-21.6).
+   For immediate feedback on the resolved path, the proxy emits an INFO
+   line on stderr at startup: `file logging enabled: path=<absolute-path>`.
+8. **Backup count lower bound:** `logging.file.backup_count` must be ≥ 1.
+   Zero would make the size cap non-enforceable due to stdlib
+   `RotatingFileHandler` behavior (see §3 `logging` parameter reference).
 
 ## 5. Configuration Variants
 
@@ -266,6 +316,15 @@ cache:
   path: ".cache/firecrawl-mcp.json"
   auto_refresh: true
 ```
+
+**File logging in variants.** All three variants ship a `logging` section
+enabled by default (see the YAML above and the corresponding files under
+`examples/`). Users who do not want file logging delete the `logging` block;
+its absence is the documented way to disable the feature (FR-21.1). No
+separate "with logging" variant is needed — the shape is the same across
+transports and is documented in §3 `logging` parameter reference. For
+operational guidance (tailing, incident reproduction with DEBUG, rotation
+footprint), see the README "File logging" section.
 
 ## 6. Cache File Format
 

@@ -31,3 +31,7 @@ def serve(config: str, verbose: int) -> None:
     loaded = load_config(Path(config))
     runner = ProxyRunner(loaded, verbose=verbose)
     asyncio.run(runner.run())
+
+
+if __name__ == "__main__":
+    main()

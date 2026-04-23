@@ -5,7 +5,9 @@ from mcp_standby_proxy.config import (
     BackendTransport,
     HealthcheckType,
     LoadedConfig,
+    LogFileLevel,
     load_config,
+    _parse_size,
 )
 from mcp_standby_proxy.errors import ConfigError
 
@@ -285,3 +287,150 @@ def test_absolute_cache_path_nonexistent_parent_accepted(tmp_path) -> None:
     data["cache"]["path"] = str(absent / "cache.json")
     loaded = load_config(_write_config(tmp_path, data))
     assert loaded.resolved_cache_path == (absent / "cache.json").resolve()
+
+
+# ---- FR-21 logging section tests ----
+
+def _add_logging_section(data: dict, **overrides) -> dict:
+    """Add a minimal logging.file section to a config dict, with optional field overrides."""
+    log_cfg: dict = {"path": "./test.log"}
+    log_cfg.update(overrides)
+    data["logging"] = {"file": log_cfg}
+    return data
+
+
+def test_logging_section_absent_gives_no_log_path(tmp_path) -> None:
+    loaded = load_config(_write_config(tmp_path, _make_sse_config(tmp_path)))
+    assert loaded.config.logging is None
+    assert loaded.resolved_log_path is None
+
+
+def test_logging_section_with_defaults(tmp_path) -> None:
+    data = _add_logging_section(_make_sse_config(tmp_path))
+    loaded = load_config(_write_config(tmp_path, data))
+    log = loaded.config.logging
+    assert log is not None
+    assert log.file.path == "./test.log"
+    assert log.file.level == LogFileLevel.INFO
+    assert log.file.max_size == "10MB"
+    assert log.file.backup_count == 3
+
+
+def test_logging_section_resolved_log_path(tmp_path) -> None:
+    data = _add_logging_section(_make_sse_config(tmp_path), path=".logs/proxy.log")
+    loaded = load_config(_write_config(tmp_path, data))
+    assert loaded.resolved_log_path == (tmp_path / ".logs" / "proxy.log").resolve()
+
+
+def test_logging_section_absolute_path_used_as_is(tmp_path) -> None:
+    abs_path = str(tmp_path / "logs" / "proxy.log")
+    data = _add_logging_section(_make_sse_config(tmp_path), path=abs_path)
+    loaded = load_config(_write_config(tmp_path, data))
+    assert loaded.resolved_log_path == (tmp_path / "logs" / "proxy.log").resolve()
+
+
+def test_logging_level_debug_accepted(tmp_path) -> None:
+    data = _add_logging_section(_make_sse_config(tmp_path), level="debug")
+    loaded = load_config(_write_config(tmp_path, data))
+    assert loaded.config.logging is not None
+    assert loaded.config.logging.file.level == LogFileLevel.DEBUG
+
+
+def test_logging_level_critical_accepted(tmp_path) -> None:
+    data = _add_logging_section(_make_sse_config(tmp_path), level="critical")
+    loaded = load_config(_write_config(tmp_path, data))
+    assert loaded.config.logging is not None
+    assert loaded.config.logging.file.level == LogFileLevel.CRITICAL
+
+
+def test_logging_level_invalid_raises(tmp_path) -> None:
+    data = _add_logging_section(_make_sse_config(tmp_path), level="verbose")
+    with pytest.raises(ConfigError):
+        load_config(_write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize("size_str,expected_bytes", [
+    ("1KB", 1_000),
+    ("10MB", 10_000_000),
+    ("2GiB", 2 * 1_073_741_824),
+    ("500KiB", 500 * 1_024),
+    ("1000B", 1_000),  # exactly 1 KB minimum in bytes notation
+])
+def test_parse_size_valid(size_str: str, expected_bytes: int) -> None:
+    assert _parse_size(size_str) == expected_bytes
+
+
+@pytest.mark.parametrize("bad_size", [
+    "10 MB",    # space not allowed
+    "10mb",     # lowercase unit
+    "10",       # bare integer
+    "infinity",
+    "-10MB",    # negative (fails regex)
+    "10TB",     # unknown unit
+    "1B",       # below 1 KB minimum
+    "11GB",     # above 10 GB maximum
+])
+def test_parse_size_invalid_raises(bad_size: str) -> None:
+    with pytest.raises(ValueError):
+        _parse_size(bad_size)
+
+
+def test_logging_max_size_accepted(tmp_path) -> None:
+    data = _add_logging_section(_make_sse_config(tmp_path), max_size="5MB")
+    loaded = load_config(_write_config(tmp_path, data))
+    assert loaded.config.logging is not None
+    assert loaded.config.logging.file.max_size == "5MB"
+    assert loaded.config.logging.file.max_size_bytes == 5_000_000
+
+
+def test_logging_max_size_invalid_raises(tmp_path) -> None:
+    data = _add_logging_section(_make_sse_config(tmp_path), max_size="10 MB")
+    with pytest.raises(ConfigError):
+        load_config(_write_config(tmp_path, data))
+
+
+def test_logging_backup_count_minimum_1(tmp_path) -> None:
+    data = _add_logging_section(_make_sse_config(tmp_path), backup_count=1)
+    loaded = load_config(_write_config(tmp_path, data))
+    assert loaded.config.logging is not None
+    assert loaded.config.logging.file.backup_count == 1
+
+
+def test_logging_backup_count_zero_raises(tmp_path) -> None:
+    data = _add_logging_section(_make_sse_config(tmp_path), backup_count=0)
+    with pytest.raises(ConfigError):
+        load_config(_write_config(tmp_path, data))
+
+
+def test_logging_backup_count_101_raises(tmp_path) -> None:
+    data = _add_logging_section(_make_sse_config(tmp_path), backup_count=101)
+    with pytest.raises(ConfigError):
+        load_config(_write_config(tmp_path, data))
+
+
+def test_logging_backup_count_100_accepted(tmp_path) -> None:
+    data = _add_logging_section(_make_sse_config(tmp_path), backup_count=100)
+    loaded = load_config(_write_config(tmp_path, data))
+    assert loaded.config.logging is not None
+    assert loaded.config.logging.file.backup_count == 100
+
+
+def test_logging_empty_section_raises(tmp_path) -> None:
+    data = _make_sse_config(tmp_path)
+    data["logging"] = {}
+    with pytest.raises(ConfigError):
+        load_config(_write_config(tmp_path, data))
+
+
+def test_logging_empty_file_section_raises(tmp_path) -> None:
+    data = _make_sse_config(tmp_path)
+    data["logging"] = {"file": {}}
+    with pytest.raises(ConfigError):
+        load_config(_write_config(tmp_path, data))
+
+
+def test_logging_file_empty_path_raises(tmp_path) -> None:
+    data = _make_sse_config(tmp_path)
+    data["logging"] = {"file": {"path": "   "}}
+    with pytest.raises(ConfigError):
+        load_config(_write_config(tmp_path, data))

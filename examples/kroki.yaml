@@ -38,3 +38,13 @@ lifecycle:
 cache:
   path: "./kroki_cache.json"
   auto_refresh: true
+
+# File logging is opt-in: remove the `logging` section to disable it.
+# Required under MCP clients that do not persist child-process stderr
+# (notably Claude Code — see README "File logging" section).
+logging:
+  file:
+    path: "./kroki.log"
+    level: info              # raise to `debug` to reproduce a specific incident
+    max_size: "10MB"
+    backup_count: 3          # max disk usage: ~40 MB (active + 3 backups)

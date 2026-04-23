@@ -43,3 +43,13 @@ lifecycle:
 cache:
   path: ".cache/firecrawl-mcp.json"
   auto_refresh: true
+
+# File logging is opt-in: remove the `logging` section to disable it.
+# Required under MCP clients that do not persist child-process stderr
+# (notably Claude Code — see README "File logging" section).
+logging:
+  file:
+    path: ".logs/firecrawl.log"
+    level: info
+    max_size: "10MB"
+    backup_count: 3

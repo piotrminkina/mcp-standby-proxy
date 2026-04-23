@@ -113,6 +113,34 @@ flowchart TD
 No concurrent transitions. Requests arriving mid-transition are queued and drained
 when the terminal state is reached (Active: forward all, Failed: error all).
 
+### 2.1 Logging handlers in the event loop (FR-19, FR-21)
+
+Both the stderr handler (`logging.StreamHandler`) and the optional file
+handler (`logging.handlers.RotatingFileHandler`) are **synchronous**.
+`logger.warning(...)`, `logger.info(...)`, etc. called from any of the six
+asyncio tasks above will block the event loop for the duration of the
+write (stderr: typically a pipe to the parent, sub-millisecond; file: disk
+I/O + possible rotation, potentially milliseconds under DEBUG with large
+Kroki-style base64 payloads).
+
+**MVP acceptance:** sync I/O is acceptable because (a) stderr is already a
+sync pipe in the current design and its cost has been measured acceptable;
+(b) the file handler is opt-in via FR-21 and defaults to `info` level (no
+payload-level records by default — see config-spec §3 `logging`); (c) the
+dominant latency source is the backend transport, not logging.
+
+**Regression trigger:** if the `proxy routing latency < 100ms` success
+metric (PRD §6.1) regresses when `logging.file.level: debug` is used in
+real traffic, migrate to stdlib `QueueHandler` + a listener thread.
+`QueueHandler` hands records off to a background thread that performs the
+file I/O, releasing the event loop immediately. Post-MVP; tracked as a
+follow-up, not a blocker.
+
+**No file-handler lock required.** `RotatingFileHandler.emit` acquires
+`self.lock` (threading.RLock) around each write/rollover; single-process
+safety is inherited from stdlib. Multi-process safety is NOT provided
+(PRD §7 risk row: multiple proxies on the same log path).
+
 ## 3. Key Flows
 
 ### 3.1 Cold Cache Bootstrap (tools/list with no cache)

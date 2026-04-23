@@ -92,6 +92,11 @@ Reference configs per transport:
 - [`examples/firecrawl.yaml`](examples/firecrawl.yaml) — **Streamable HTTP** backend, Docker Compose lifecycle
 - [`examples/claude-context.yaml`](examples/claude-context.yaml) — **stdio** backend with a dependency service (Milvus) managed via `systemctl`
 
+Each example ships with an opt-in `logging` section enabled by default
+(required under Claude Code and other clients that do not persist
+child-process stderr — see "File logging" below). Remove the section to
+disable file logging.
+
 Minimal schema:
 
 ```yaml
@@ -147,6 +152,45 @@ backend:
   transport: streamable_http
   url: "http://localhost:5100/mcp"
 ```
+
+### File logging (Claude Code and other agent-mode deployments)
+
+Claude Code does not persist child-process stderr to disk
+([anthropics/claude-code#29035](https://github.com/anthropics/claude-code/issues/29035)),
+so transport errors and lifecycle events are invisible without extra setup. Add a
+`logging.file` section to any config to write the same records to a local rotating
+log file:
+
+```yaml
+logging:
+  file:
+    path: ".logs/kroki.log"
+    level: info              # raise to `debug` to reproduce a specific incident
+    max_size: "10MB"
+    backup_count: 3          # max disk usage: ~40 MB (active + 3 backups)
+```
+
+**How it works:**
+
+- Absence of the `logging` key disables file logging entirely — no files created,
+  no disk I/O. Stderr output is unchanged.
+- File level is independent of `-v`/`-vv`: you can run stderr at `WARNING` while
+  the file captures `DEBUG`.
+- The proxy creates intermediate directories automatically. If the path cannot be
+  opened (permission denied, read-only filesystem), a single warning is written to
+  stderr and the proxy continues with stderr-only logging.
+- On startup the proxy prints the resolved log path to stderr:
+  `file logging enabled: path=/abs/path/to/.logs/kroki.log`.
+- Rotation is size-based. `backup_count` must be ≥ 1 (setting it to `0` disables
+  rotation entirely — the stdlib ignores `max_size` when `backupCount=0`).
+- `max_size` format: `<integer><unit>` with no spaces.
+  Accepted units: `B`, `KB`, `MB`, `GB` (decimal) and `KiB`, `MiB`, `GiB` (binary).
+  Range: 1 KB – 10 GB.
+
+The `logging` section is present in all three example configs under
+[`examples/`](examples) — delete it to disable file logging. For the known
+deferred bug that motivated this feature (`Write stream closed` on SSE
+backends), see [`TODO.md`](TODO.md).
 
 ### Notes
 

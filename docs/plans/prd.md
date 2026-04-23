@@ -58,7 +58,7 @@ intention of using those tools in the current session.
 
 ## 3. Functional Requirements
 
-### 3.0 Implementation status (as of 2026-04-22)
+### 3.0 Implementation status (as of 2026-04-23)
 
 | FR | Title | Phase | Status |
 |----|-------|-------|--------|
@@ -82,6 +82,7 @@ intention of using those tools in the current session.
 | FR-18 | Server-to-client request forwarding | post-MVP | proposed |
 | FR-19 | Stderr logging contract | MVP | implemented |
 | FR-20 | MCP protocol version handling | MVP | implemented (pass-through) |
+| FR-21 | Optional file logging for agent-mode diagnostics | MVP | implemented |
 
 ### FR-1: Cached schema serving (MVP)
 
@@ -364,12 +365,20 @@ lost.
 
 ### FR-19: Stderr logging contract (MVP)
 
-The proxy must log operational events to stderr in a format compatible with
-service managers that capture stderr (systemd-journald, Docker log driver,
-shell redirection).
+The proxy must log operational events to stderr in a human-readable
+line-oriented format. Whether those lines are visible to the user depends
+on the process that spawned the proxy (see FR-19.1).
 
-- FR-19.1: Stderr is the **only** log output. No file handlers, no network
-  syslog, no structured telemetry export in v1.
+- FR-19.1: Stderr is the **default** log output and is always active. Its
+  visibility depends on the process that spawns the proxy — when the proxy
+  runs as an MCP stdio subprocess (primary deployment), stderr is captured
+  by the parent and may or may not be exposed by it. Claude Desktop
+  persists it to `~/Library/Logs/Claude/mcp*.log` (macOS) /
+  `%APPDATA%\Claude\logs\mcp*.log` (Windows). Claude Code does not
+  persist it (anthropics/claude-code#29035, closed as "not planned" on
+  2026-03-26). For deployments where stderr is not user-accessible,
+  enable FR-21 file logging. No network syslog and no structured
+  telemetry export in v1.
 - FR-19.2: Log format: `timestamp level [server_name] message`. Timestamp in
   ISO-8601 local time. Server name taken from `server.name` in config.
 - FR-19.3: Log levels: WARNING (default), INFO (`-v`), DEBUG (`-vv`).
@@ -380,6 +389,10 @@ shell redirection).
 - FR-19.5: For stdio backend transport, the child process's stderr is
   pass-through to the proxy's stderr (no capture, no prefixing). Users get
   interleaved proxy + backend logs on the same stream.
+- FR-19.6: Coexistence with FR-21 file logging: when enabled, the file
+  channel is additive — stderr output remains unchanged. Both channels share
+  the same formatter (FR-19.2). FR-19.4 (no stdout contamination) applies to
+  both channels by construction — neither may write to stdout.
 
 ### FR-20: MCP protocol version handling (MVP)
 
@@ -404,6 +417,83 @@ own `initialize` response to the client.
 - FR-20.4: Proxy version advertised in its own `serverInfo` is the MCP SDK's
   current protocol constant. Updated only when the SDK is upgraded.
 
+### FR-21: Optional file logging for agent-mode diagnostics (MVP)
+
+The proxy must support optional, opt-in logging to a local file, in addition to
+the always-on stderr channel (FR-19).
+
+**Context:** When the proxy is spawned as a subprocess by an MCP client that
+does not persist child-process stderr (notably Claude Code — per
+anthropics/claude-code#29035), operational events are effectively invisible
+to both the user and any AI agent performing diagnostics. Incidents such as
+`Write stream closed` from the backend transport cannot be investigated
+without running the proxy manually outside of the agent. FR-21 provides a
+local plain-text log file as a secondary diagnostic channel without
+introducing telemetry infrastructure.
+
+**Sub-requirements:**
+
+- FR-21.1: File logging is **disabled by default**. Activation requires a
+  `logging.file` section in the YAML config. Its absence is the supported way
+  to run without file logging — no CLI flag, no environment variable.
+- FR-21.2: When enabled, the stderr channel and the file channel have
+  **independent per-handler level thresholds**: stderr level is controlled
+  by `-v`/`-vv` (FR-19.3), file level by `logging.file.level`. The root
+  logger is set to the most permissive level required by any active
+  handler (`min(stderr_level, file_level)`) so that records destined for
+  the file handler are not filtered out by the root logger before dispatch.
+  Each handler then applies its own level filter. Users can run stderr at
+  WARNING while capturing DEBUG to the file.
+- FR-21.3: Each record's header line follows FR-19.2
+  (`timestamp level [server_name] message`). Exception tracebacks produced
+  by `logger.exception` are appended as additional lines below the header,
+  formatted by the stdlib `Formatter.formatException` default — multi-line
+  plain text, no JSON. Both channels receive the same rendering.
+- FR-21.4: The proxy must rotate log files to prevent unbounded growth. The
+  rotation policy is size-based with a configurable maximum file size and a
+  configurable number of retained backups (backup count ≥ 1 — rotation
+  history is required for the size cap to be enforceable; see config-spec
+  for the rationale). Rotation defaults are chosen so that a typical DEBUG
+  session (including base64-encoded tool payloads) fits within the
+  retained history without manual intervention. The effective in-file cap
+  is `max_size + size of the largest single record` because the stdlib
+  rotating handler checks size *after* writing each record.
+- FR-21.5: Relative `logging.file.path` is resolved against the config file's
+  parent directory (same rule as `cache.path`, FR-5.5). The proxy auto-creates
+  intermediate directories **on startup, before constructing the file
+  handler** — `RotatingFileHandler` opens the file at construction time and
+  does not create parents itself. Path validation is deferred in the sense
+  that a typo surfaces only when the proxy actually tries to open the file
+  at startup: a missing-parent or permission error becomes a
+  logged-to-stderr warning, the file channel is disabled for the process
+  lifetime, and the proxy continues with stderr-only logging. To give the
+  user immediate feedback, the proxy emits an INFO line on stderr at
+  startup indicating the resolved log file path (e.g.,
+  `file logging enabled: path=/abs/path/to/kroki.log`).
+- FR-21.6: File logging failures must never crash the proxy or interrupt the
+  stdin/stdout JSON-RPC loop.
+  - **Startup (handler construction) failures** — permission denied,
+    missing parent after mkdir attempt, read-only filesystem — produce a
+    single warning on stderr (`file logging disabled: <reason>`) and the
+    file channel is not installed. Stderr logging continues normally.
+  - **Runtime I/O failures** — disk full, file deleted externally, inode
+    changed — are handled by the stdlib `Handler.handleError` (writes a
+    one-line notice to stderr and continues). The proxy does not retry,
+    re-open, or crash.
+- FR-21.7: FR-19.4 (no stdout contamination) applies unchanged. Enforced at
+  setup time by an assertion that rejects any handler whose stream is
+  `sys.stdout`.
+- FR-21.8: The file channel is **plain text** — human-readable lines only.
+  No JSON logs, no structured fields, no export format. Anything beyond a
+  plain log file (Prometheus, OpenTelemetry, JSON lines) remains out of
+  scope per §4.
+- FR-21.9: Child-process stderr from stdio backend transport (FR-19.5) is
+  **not** routed through the file channel. The child's stderr is
+  pass-through to the proxy's fd 2 at the OS level and never enters
+  Python's `logging` dispatch. Users debugging a stdio backend must
+  collect the backend's stderr separately (e.g., redirect at the backend
+  entry point).
+
 ## 4. Project Scope Boundaries
 
 ### In scope (MVP)
@@ -420,6 +510,7 @@ own `initialize` response to the client.
 - Config with auto-generated schema
 - Stderr logging contract (FR-19)
 - MCP protocol version pass-through (FR-20)
+- Optional file logging for agent-mode diagnostics (FR-21)
 
 ### In scope (post-MVP phase 1)
 
@@ -454,7 +545,12 @@ Permanent non-goals (not "post-MVP"; not on the roadmap):
   emit batched requests, and the MCP SDK does not generate them. YAGNI.
 - Standalone process management with PID files.
 - GUI or web dashboard.
-- Metrics / telemetry export (stderr logs are sufficient; see FR-19).
+- Metrics / telemetry export (Prometheus, OpenTelemetry, structured JSON
+  logs, network syslog). Note: the opt-in plain-text file logger defined in
+  FR-21 is **not** telemetry export — it is a local, line-oriented log file
+  intended for human reading, produced with the same formatter as stderr.
+  Anything that requires a client library, a remote endpoint, or a parseable
+  schema is out of scope.
 - **Auto-reconnection on transport flaps.** The current Failed → cooldown → Cold
   → restart-on-next-call pattern covers the common case; MCP clients retry
   failed requests, so a brief disconnect manifests as one extra round-trip. If
@@ -575,6 +671,36 @@ Acceptance criteria:
 - All tools previously available via direct backend connection remain available.
 - Tool call results are identical to direct connection (pass-through, no
   transformation).
+
+---
+
+**US-020: Diagnose a proxy incident in agent-mode deployment**
+
+As a developer running the proxy as an MCP subprocess under an agent runtime
+that does not persist child-process stderr (e.g., Claude Code), I want to
+enable a local debug log file so that I can diagnose transport errors or
+lifecycle failures without restarting the proxy outside the agent.
+
+Acceptance criteria:
+- Adding a `logging.file` section to the config and restarting the agent is the
+  only activation step (no CLI flags, no env vars).
+- After the next incident reproduction with `level: debug`, the configured log
+  file contains DEBUG entries covering the request path, backend transport
+  calls, and any exception tracebacks.
+- Running without a `logging.file` section produces identical behavior to
+  before FR-21 (stderr-only; no file created, no disk I/O).
+- Stderr level remains under control of `-v`/`-vv` regardless of
+  `logging.file.level` — the two channels filter independently (FR-21.2).
+- The file has bounded size — once `max_size` is exceeded, rotation produces
+  numbered backups and oldest beyond `backup_count` are evicted.
+- stdout remains pure JSON-RPC throughout (verifiable by
+  `jq -c . < stdout-capture` over any capture taken with file logging
+  enabled at DEBUG).
+- A misconfigured path (unwritable directory, permission denied, non-existent
+  parent that cannot be mkdir'd) produces a single stderr warning and does
+  not prevent the proxy from running; stderr-only logging continues.
+- A resolved log file path is announced on stderr at startup (INFO line) so
+  the user sees where logs actually land.
 
 ---
 
@@ -774,6 +900,12 @@ Targets to verify when each respective feature ships.
 | Server-to-client requests silently dropped | Medium | Medium | Transport read loop only matches response IDs, discards server-initiated messages. FR-18 introduces background reader task and forwarding. |
 | stdio backend with long GC pause on SIGTERM | Low | Low | FR-8.3 2s+2s (SDK default) may SIGKILL a legitimately-slow backend. Reopen and consider a fork of the SDK's `stdio_client` if this surfaces in practice. |
 | Stdout contamination corrupts JSON-RPC stream | High | Low | FR-19.4 hard invariant: stderr-only logging. Enforced by log handler configuration; regression risk on new code paths. |
+| Incident invisible under agent-mode deployment (stderr captured by parent) | High | High (primary use case under Claude Code) | FR-21 file logging **available** for opt-in. All shipped `examples/*.yaml` include an active `logging` section by default; users who copy an example get file logging out of the box, and can remove the section to disable it. README "File logging" section documents the behavior. Residual risk for users who write configs from scratch without consulting examples — accepted trade-off vs. making file logging default-on in the schema (which would surprise users with unexpected disk I/O). |
+| File log grows unbounded during DEBUG with large payloads (e.g., Kroki base64 PNGs) | Medium | Medium | FR-21.4 size-based rotation with configurable retention; `backup_count ≥ 1` required (stdlib `RotatingFileHandler` ignores `max_size` when `backupCount=0`). Defaults tuned for a typical DEBUG session to fit in retained history. |
+| Multiple proxy instances writing to the same `logging.file.path` (two Claude Code windows, same config) interleave or corrupt lines | Medium | Low | No enforcement in v1. Each proxy uses single-process `RotatingFileHandler`, which is thread-safe but not multi-process-safe. Users running concurrent sessions on the same config should set different `logging.file.path` values. Post-MVP candidate: `ConcurrentRotatingFileHandler` from `concurrent-log-handler`. |
+| Exception tracebacks leak sensitive data (API tokens, credentials) from local variables or param dicts into the log file | Medium | Low | Python's default `Formatter.formatException` does not include local variable reprs — only the stack frames and exception message. Risk is confined to exception *messages* that include sensitive values (e.g., a ConfigError echoing `backend.env`). Mitigation: avoid embedding secret values in exception messages (code-review concern). Not enforced by schema. |
+| Sync file I/O on the event loop adds per-record latency under DEBUG with large payloads, regressing the `proxy routing latency < 100ms` success metric | Medium | Medium | MVP accepts sync `FileHandler` / `RotatingFileHandler`. If real measurements show regression, post-MVP migration to `QueueHandler` + listener thread is the planned path. Tracked in tech-spec §2. |
+| Failure loops (backend start/fail/retry) produce continuous DEBUG logs with full tracebacks, evicting useful historical data from rotation backups before the user notices | Low | Medium | Accepted. The same rotation policy that caps disk usage also caps retention during outages. Users can raise `backup_count` temporarily during an active incident. |
 | **OSS publication — unsolicited issue triage load** | Low | Medium | Document expectations in README (personal tool, best-effort support). Add issue templates. |
 | **OSS publication — supply chain via lifecycle.command** | Medium | Low | Config is trusted input (§8). Warn users in README that YAML files downloaded from third parties can execute arbitrary commands at `lifecycle.start` time. |
 | **OSS publication — security disclosure process** | Low | Low | `SECURITY.md` with contact method and response-time expectations. |
@@ -787,7 +919,7 @@ Targets to verify when each respective feature ships.
 | **Config is trusted input.** Lifecycle commands are arbitrary shell commands from YAML. | No sandboxing or command validation beyond schema. Acceptable for personal tool. Documented in README for OSS users — YAML files from untrusted sources must not be run. |
 | **No JSON-RPC batch support.** | If an MCP client sends batched requests, proxy rejects them with an error. Permanent non-goal (§4). |
 | **Interpreter runtime required (MVP).** Standalone binary is post-MVP. | MVP requires a compatible runtime on host (or a version manager that provides it). |
-| **Logs on stderr only.** No structured telemetry export. | Compatible with service managers that capture stderr (systemd-journald, Docker log driver). Sufficient for personal tool. FR-19.4 makes stdout-contamination a hard invariant. |
+| **Stderr is the default log channel; its visibility depends on the parent (FR-19, FR-21).** No structured telemetry export. | MCP clients spawn the proxy as a stdio subprocess — stderr is captured by the parent. Whether a user can read it depends on the client: Claude Desktop persists it to `~/Library/Logs/Claude/mcp*.log` (macOS) / `%APPDATA%\Claude\logs\mcp*.log` (Windows); Claude Code does not persist it (anthropics/claude-code#29035, closed as "not planned" on 2026-03-26). For diagnostics under clients that do not persist stderr, enable FR-21 file logging. FR-19.4 makes stdout-contamination a hard invariant on all channels. |
 | **Cache invalidation is manual (MVP).** Delete cache file + restart proxy. `warm` command available in post-MVP phase 1. | Users must remember to manually invalidate cache after backend updates. No automatic detection of tool changes until schema refresh (post-MVP). |
 | **MCP protocol version not enforced by proxy (FR-20).** | Mismatched client/backend versions surface as backend-side errors on tool calls, not proxy rejections. Version negotiation is between client and backend; proxy is transparent. |
 | **stdio shutdown timeouts inherited from MCP SDK at 2s + 2s (FR-8.3).** | Not configurable in v1. Backends that legitimately need >4s to exit gracefully would be SIGKILLed. Extending would require forking the SDK's `stdio_client`; revisit if observed. |

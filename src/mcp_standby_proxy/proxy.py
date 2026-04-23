@@ -1,10 +1,12 @@
 import asyncio
 import logging
+import logging.handlers
 import sys
+from pathlib import Path
 from typing import Any
 
 from mcp_standby_proxy.cache import CacheManager
-from mcp_standby_proxy.config import LoadedConfig
+from mcp_standby_proxy.config import LoadedConfig, LoggingFileConfig
 from mcp_standby_proxy.jsonrpc import JsonRpcReader, JsonRpcWriter
 from mcp_standby_proxy.lifecycle import LifecycleManager
 from mcp_standby_proxy.router import MessageRouter
@@ -23,25 +25,85 @@ class _ServerNameFormatter(logging.Formatter):
         self._server_name = server_name
 
     def format(self, record: logging.LogRecord) -> str:
-        if not hasattr(record, "server_name"):
-            record.server_name = self._server_name
-        return super().format(record)
+        # Copy the record to avoid mutating the shared LogRecord across handlers.
+        # Multiple handlers with different server names would otherwise stomp on
+        # each other when the first handler sets record.server_name.
+        r = logging.makeLogRecord(record.__dict__)
+        r.server_name = self._server_name
+        return super().format(r)
 
 
-def _setup_logging(server_name: str, verbose: int = 0) -> None:
-    """Configure root logger to write to stderr."""
-    level = logging.WARNING
+def _setup_logging(
+    server_name: str,
+    verbose: int = 0,
+    log_file_config: LoggingFileConfig | None = None,
+    resolved_log_path: Path | None = None,
+) -> None:
+    """Configure root logger with stderr handler and optional file handler.
+
+    Stderr level is controlled by verbose (0=WARNING, 1=INFO, 2+=DEBUG).
+    File handler level is independent (log_file_config.level).
+    Root logger is set to min(stderr_level, file_level) so records reach
+    whichever handler needs them (FR-21.2).
+
+    FR-21.5/FR-21.6: file handler construction failures produce a single
+    stderr warning; the file channel is not installed and the proxy continues.
+    FR-21.7: stdout handlers are rejected by assertion.
+    """
+    stderr_level = logging.WARNING
     if verbose == 1:
-        level = logging.INFO
+        stderr_level = logging.INFO
     elif verbose >= 2:
-        level = logging.DEBUG
+        stderr_level = logging.DEBUG
 
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(_ServerNameFormatter(server_name))
+    formatter = _ServerNameFormatter(server_name)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    assert stderr_handler.stream is not sys.stdout, "stderr handler must not write to stdout"
+    stderr_handler.setLevel(stderr_level)
+    stderr_handler.setFormatter(formatter)
 
     root = logging.getLogger()
-    root.setLevel(level)
-    root.addHandler(handler)
+    root.addHandler(stderr_handler)
+
+    effective_root_level = stderr_level
+
+    if log_file_config is not None and resolved_log_path is not None:
+        file_level = log_file_config.level.to_logging_level()
+        effective_root_level = min(stderr_level, file_level)
+
+        # Set root level early so the startup INFO/WARNING messages below are not
+        # suppressed by the default root-level WARNING gate.
+        root.setLevel(effective_root_level)
+
+        try:
+            resolved_log_path.parent.mkdir(parents=True, exist_ok=True)
+            rotating_handler = logging.handlers.RotatingFileHandler(
+                filename=resolved_log_path,
+                maxBytes=log_file_config.max_size_bytes,
+                backupCount=log_file_config.backup_count,
+                encoding="utf-8",
+            )
+            rotating_handler.setLevel(file_level)
+            rotating_handler.setFormatter(formatter)
+            root.addHandler(rotating_handler)
+            # Print directly to stderr — bypasses the handler level filter so the
+            # path is always visible regardless of the -v flag (FR-21.5).
+            print(f"file logging enabled: path={resolved_log_path}", file=sys.stderr)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "file logging disabled: %s", exc
+            )
+
+    root.setLevel(effective_root_level)
+
+    # FR-21.7 / FR-19.4: scan all active handlers — none may write to stdout.
+    for _h in root.handlers:
+        if isinstance(_h, logging.StreamHandler) and _h.stream is sys.stdout:
+            raise AssertionError(
+                f"Handler {_h!r} writes to stdout — violates FR-19.4/FR-21.7. "
+                "Stdout is reserved exclusively for JSON-RPC traffic."
+            )
 
 
 class ProxyRunner:
@@ -51,6 +113,7 @@ class ProxyRunner:
         self._config = loaded.config
         self._config_dir = loaded.config_dir
         self._resolved_cache_path = loaded.resolved_cache_path
+        self._resolved_log_path = loaded.resolved_log_path
         self._verbose = verbose
         self._shutdown_event = asyncio.Event()
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -59,7 +122,15 @@ class ProxyRunner:
 
     async def run(self) -> None:
         """Main entry point. Reads messages from stdin until EOF or shutdown."""
-        _setup_logging(self._config.server.name, self._verbose)
+        log_file_config = (
+            self._config.logging.file if self._config.logging is not None else None
+        )
+        _setup_logging(
+            self._config.server.name,
+            self._verbose,
+            log_file_config=log_file_config,
+            resolved_log_path=self._resolved_log_path,
+        )
         logger = logging.getLogger(__name__)
         logger.info("Starting mcp-standby-proxy for '%s'", self._config.server.name)
 
@@ -88,9 +159,11 @@ class ProxyRunner:
         )
         self._router = router
 
-        # Set up stdin reader
+        # Set up stdin reader — 16 MB limit to handle large tool payloads.
+        # asyncio.StreamReader's default 64 KB limit triggers LimitOverrunError
+        # on tools/call requests with large arguments.
         loop = asyncio.get_event_loop()
-        reader = asyncio.StreamReader()
+        reader = asyncio.StreamReader(limit=16 * 1024 * 1024)
         protocol = asyncio.StreamReaderProtocol(reader)
         await loop.connect_read_pipe(lambda: protocol, sys.stdin)
         rpc_reader = JsonRpcReader(reader)

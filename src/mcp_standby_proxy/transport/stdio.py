@@ -62,6 +62,9 @@ class StdioTransport:
             env=merged_env,
             cwd=str(self._cwd),
         )
+        # FR-21.9: child stderr is pass-through to the proxy's fd 2 at the OS level
+        # (SDK default — no capture, no Python logging dispatch). Users debugging a
+        # stdio backend must collect its stderr separately.
         ctx = stdio_client(params)
         try:
             self._read_stream, self._write_stream = await ctx.__aenter__()

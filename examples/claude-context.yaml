@@ -48,3 +48,16 @@ lifecycle:
 cache:
   path: ".cache/claude-context-mcp.json"
   auto_refresh: true
+
+# File logging is opt-in: remove the `logging` section to disable it.
+# Required under MCP clients that do not persist child-process stderr
+# (notably Claude Code — see README "File logging" section).
+# Note: for stdio backends, the backend child process's stderr passes
+# through to the proxy's fd 2 at the OS level and does NOT flow through
+# this file channel (FR-21.9). Capture backend stderr separately if needed.
+logging:
+  file:
+    path: ".logs/claude-context.log"
+    level: info
+    max_size: "10MB"
+    backup_count: 3
