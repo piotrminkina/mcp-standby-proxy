@@ -65,45 +65,41 @@ lifetime — not a single request scope.
 
 The proxy runs six cooperating asyncio tasks within a single event loop:
 
-```plantuml
-@startuml
-skinparam backgroundColor #2b2b2b
-skinparam defaultFontColor #cccccc
-skinparam defaultFontName Helvetica
-skinparam arrowColor #aaaaaa
-skinparam arrowFontColor #aaaaaa
-skinparam arrowFontSize 10
-skinparam packageBackgroundColor #313131
-skinparam packageBorderColor #666666
-skinparam packageFontColor #cccccc
-skinparam componentStyle rectangle
-skinparam componentFontColor #1a1a1a
-skinparam componentFontSize 12
-skinparam stereotypeFontColor #555555
-skinparam stereotypeFontSize 10
-skinparam noteFontColor #cccccc
+```mermaid
+%%{init: {'theme':'dark', 'themeVariables': {'fontFamily':'Helvetica','fontSize':'13px'}}}%%
+flowchart TD
+    subgraph EL["asyncio event loop"]
+        stdin["<b>stdin_reader</b><br/>StreamReader → parse JSON-RPC"]
+        router["<b>message_router</b><br/>initialize | */list | tools/call | ping"]
+        lifecycle["<b>lifecycle_manager</b><br/>state machine · start/stop · healthcheck<br/>BackendTransport · capability fetch"]
+        stdout["<b>stdout_writer</b><br/>JSON-RPC → sys.stdout"]
+        idle["<b>idle_timer</b><br/>reset on activity · fire stop on expiry"]
+        refresh["<b>schema_refresh</b> <i>(on-demand)</i><br/>fetch */list · compare · update cache · notify"]
+    end
 
-package "asyncio event loop" {
-    [**stdin_reader**\nStreamReader → parse JSON-RPC] as stdin #b8e6c8
-    [**message_router**\ninitialize | */list | tools/call | ping] as router #a8d4f0
-    [**lifecycle_manager**\nstate machine · start/stop · healthcheck\nBackendTransport · capability fetch] as lifecycle #d4bfe8
-    [**stdout_writer**\nJSON-RPC → sys.stdout] as stdout #b8e6c8
-    [**idle_timer**\nreset on activity · fire stop on expiry] as idle #f0e6a8
-    [**schema_refresh** //(on-demand)//\nfetch */list · compare · update cache · notify] as refresh #f0e6a8
-}
+    NL["<b>asyncio.Lock</b><br/>serializes state<br/>transitions"]
+    NL -.- lifecycle
 
-note "**asyncio.Lock**\nserializes state\ntransitions" as NL #3c3c2e
-NL .. lifecycle
+    stdin -->|Queue| router
+    router -->|ensure_active| lifecycle
+    lifecycle -->|Event state change| router
+    router -->|Queue| stdout
+    lifecycle -->|create_task| refresh
+    refresh -->|notify */list_changed| stdout
+    router -.->|reset| idle
+    idle -->|trigger stop| lifecycle
 
-stdin -down-> router : "Queue"
-router -down-> lifecycle : "ensure_active()"
-lifecycle -up-> router : "Event (state change)"
-router -right-> stdout : "Queue"
-lifecycle -right-> refresh : "create_task()"
-refresh -up-> stdout : "notify */list_changed"
-router ..> idle : "reset"
-idle -down-> lifecycle : "trigger stop"
-@enduml
+    classDef io fill:#b8e6c8,stroke:#5a8a6a,color:#1a1a1a
+    classDef ctrl fill:#a8d4f0,stroke:#5a7a9a,color:#1a1a1a
+    classDef state fill:#d4bfe8,stroke:#8a6aa0,color:#1a1a1a
+    classDef timer fill:#f0e6a8,stroke:#9a8a5a,color:#1a1a1a
+    classDef note fill:#3c3c2e,stroke:#888,color:#cccccc
+
+    class stdin,stdout io
+    class router ctrl
+    class lifecycle state
+    class idle,refresh timer
+    class NL note
 ```
 
 **Inter-task communication:**
@@ -124,59 +120,43 @@ when the terminal state is reached (Active: forward all, Failed: error all).
 Triggered when client sends `tools/list` (or any `*/list`) and no cache file exists.
 This is the most complex flow — it combines lifecycle startup with cache creation.
 
-```plantuml
-@startuml
-skinparam backgroundColor #2b2b2b
-skinparam defaultFontColor #cccccc
-skinparam defaultFontName Helvetica
-skinparam sequenceArrowColor #cccccc
-skinparam sequenceLifeLineBorderColor #666666
-skinparam sequenceParticipantBackgroundColor #3c3f41
-skinparam sequenceParticipantBorderColor #5a5d5e
-skinparam sequenceGroupBackgroundColor #313131
-skinparam sequenceGroupBorderColor #555555
-skinparam sequenceDividerBackgroundColor #3c3f41
-skinparam noteBackgroundColor #3c3c2e
-skinparam noteBorderColor #555555
+```mermaid
+%%{init: {'theme':'dark', 'themeVariables': {'fontFamily':'Helvetica','fontSize':'13px','actorBkg':'#3c3f41','actorBorder':'#5a5d5e','actorTextColor':'#cccccc','noteBkgColor':'#3c3c2e','noteTextColor':'#cccccc','noteBorderColor':'#666'}}}%%
+sequenceDiagram
+    participant C as Client<br/>(MCP client)
+    participant P as Proxy<br/>(mcp-standby-proxy)
+    participant B as Backend<br/>(real MCP server)
 
-participant "Client\n(MCP client)" as C
-participant "Proxy\n(mcp-standby-proxy)" as P
-participant "Backend\n(real MCP server)" as B
+    C->>+P: tools/list {id:1}
+    Note right of P: cache miss → Cold → Starting
 
-C -> P: tools/list {id:1}
-activate P #3a4a5c
+    rect rgba(240, 230, 168, 0.12)
+        P->>B: exec start command (cwd=config_dir)
+        P->>B: healthcheck poll (loop)
+        B-->>P: healthcheck pass
+    end
 
-note right of P: cache miss → Cold → Starting
+    Note right of P: Starting → Healthy
 
-P -> B: exec start command (cwd=config_dir)
-P -> B: healthcheck poll (loop)
-B --> P: healthcheck pass
+    rect rgba(212, 191, 232, 0.12)
+        P->>B: connect transport (SSE/HTTP/stdio)
+        P->>B: initialize
+        B-->>P: InitializeResult (capabilities)
+        P->>B: notifications/initialized
+        Note right of P: read capabilities
+        P->>B: tools/list {id:internal}
+        B-->>P: {"tools":[...]}
+        P->>B: resources/list (if declared)
+        B-->>P: {"resources":[...]}
+        P->>B: prompts/list (if declared)
+        B-->>P: {"prompts":[...]}
+    end
 
-note right of P: Starting → Healthy
-
-P -> B: connect transport (SSE/HTTP/stdio)
-P -> B: initialize
-B --> P: InitializeResult (capabilities)
-P -> B: notifications/initialized
-
-note right of P: read capabilities
-
-P -> B: tools/list {id:internal}
-B --> P: {"tools":[...]}
-
-P -> B: resources/list (if declared)
-B --> P: {"resources":[...]}
-
-P -> B: prompts/list (if declared)
-B --> P: {"prompts":[...]}
-
-P --> C: {id:1, result: {"tools":[...]}}
-note left of P #2a3a2a: PRIORITY:\nunblock client first
-
-note right of P: Healthy → Active\nASYNC: save cache to disk\nbackend stays running
-
-deactivate P
-@enduml
+    rect rgba(184, 230, 200, 0.12)
+        P-->>-C: {id:1, result: {"tools":[...]}}
+        Note left of P: PRIORITY:<br/>unblock client first
+        Note right of P: Healthy → Active<br/>ASYNC: save cache to disk<br/>backend stays running
+    end
 ```
 
 **Key ordering constraint:** Return the triggering `*/list` response to the client
