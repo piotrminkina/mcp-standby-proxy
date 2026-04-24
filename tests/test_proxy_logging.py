@@ -3,7 +3,6 @@ import logging
 import logging.handlers
 import re
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -277,7 +276,8 @@ def test_log_format_matches_spec_regex(tmp_path) -> None:
     content = log_path.read_text().strip().splitlines()
     # Find the line from this test — keyed on both server name and unique message text
     target_line = next(
-        (l for l in content if "[testsvr]" in l and "unique-fmt-check-msg" in l), None
+        (line for line in content if "[testsvr]" in line and "unique-fmt-check-msg" in line),
+        None,
     )
     assert target_line is not None, f"Expected log line not found. File content:\n{''.join(content)}"
     assert re.match(
