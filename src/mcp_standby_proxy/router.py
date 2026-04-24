@@ -115,12 +115,13 @@ class MessageRouter:
             # Notification
             state = self._sm.state
             if state == BackendState.ACTIVE and self._transport is not None:
+                stale_transport = self._transport  # capture before await (FR-22.6)
                 try:
-                    await self._transport.notify(method, message.get("params"))
+                    await stale_transport.notify(method, message.get("params"))
                 except TransportError as exc:
                     # Mid-session transport death on a notification path (FR-22.4).
                     # Transition to FAILED under lock; no retry (notifications are fire-and-forget).
-                    await self._detect_transport_death(method, exc)
+                    await self._detect_transport_death(method, exc, stale_transport)
                 except Exception as exc:
                     logger.warning(
                         "[%s] Failed to forward notification: %s",
@@ -184,9 +185,10 @@ class MessageRouter:
             return
 
         assert self._transport is not None
+        stale_transport = self._transport  # capture before await (FR-22.6)
         try:
             internal_id = self._id_mapper.next_internal_id()
-            result = await self._transport.request(method, id=internal_id)
+            result = await stale_transport.request(method, id=internal_id)
             actual_result = result.get("result", {})
             await self._writer.write_message(make_response(id=msg_id, result=actual_result))
 
@@ -203,7 +205,7 @@ class MessageRouter:
 
         except TransportError as exc:
             # Mid-session transport death — attempt single inline recovery (FR-22.2)
-            await self._detect_transport_death(method, exc)
+            await self._detect_transport_death(method, exc, stale_transport)
             timeout = min(self._config.lifecycle.start.timeout, 60.0)
 
             async def _cacheable_retry() -> dict[str, Any]:
@@ -303,9 +305,10 @@ class MessageRouter:
             return
 
         assert self._transport is not None
+        stale_transport = self._transport  # capture before await (FR-22.6)
         proxy_id = self._id_mapper.wrap(msg_id)
         try:
-            result = await self._transport.request(method, message.get("params"), id=proxy_id)
+            result = await stale_transport.request(method, message.get("params"), id=proxy_id)
             original_id = self._id_mapper.unwrap(proxy_id)
             # Forward whatever the backend returned, with original client ID
             if "result" in result:
@@ -329,7 +332,7 @@ class MessageRouter:
             except KeyError:
                 original_id = msg_id
 
-            await self._detect_transport_death(method, exc)
+            await self._detect_transport_death(method, exc, stale_transport)
             timeout = min(self._config.lifecycle.start.timeout, 60.0)
 
             async def _forwarded_retry() -> dict[str, Any]:
@@ -416,20 +419,39 @@ class MessageRouter:
                 make_error(id=original_id, code=INTERNAL_ERROR, message=str(exc))
             )
 
-    async def _detect_transport_death(self, method: str, exc: Exception) -> None:
+    async def _detect_transport_death(
+        self, method: str, exc: Exception, stale_transport: BackendTransport | None
+    ) -> None:
         """Transition ACTIVE → FAILED on mid-session transport death (FR-22.1).
 
         Must be called immediately after catching TransportError from transport.request()
-        or transport.notify(). _failure_time is intentionally NOT set here — the cooldown
-        write point is the retry-failure branch, so the retry's ensure_active() does not
-        trip the cooldown gate before _do_start() runs.
+        or transport.notify(). Caller must pass the transport reference that was in use
+        when the error occurred (captured before the await) so that concurrent handlers
+        do not tear down a healthy transport that was already replaced by a previous
+        recovery.
+
+        _failure_time is intentionally NOT set here — the cooldown write point is the
+        retry-failure branch, so the retry's ensure_active() does not trip the cooldown
+        gate before _do_start() runs.
         """
         async with self._sm.lock:
-            if self._sm.state == BackendState.ACTIVE:
-                await self._sm.transition(BackendState.FAILED)
-            # Close transport unconditionally — regardless of who made the ACTIVE→FAILED
-            # transition, we need to clear the stale reference. All of this must be
-            # under one lock acquisition to close the TOCTOU window.
+            if self._sm.state != BackendState.ACTIVE:
+                # Another handler already detected the death and transitioned. No-op.
+                logger.debug(
+                    "[%s] transport death already handled (state=%s), skipping",
+                    self._config.server.name,
+                    self._sm.state,
+                )
+                return
+            if stale_transport is not None and self._transport is not stale_transport:
+                # Another handler already replaced the transport with a healthy one. No-op.
+                logger.debug(
+                    "[%s] transport already replaced, skipping duplicate death detection",
+                    self._config.server.name,
+                )
+                return
+            await self._sm.transition(BackendState.FAILED)
+            # Close the stale transport and clear the reference.
             if self._transport is not None:
                 try:
                     await self._transport.close()
@@ -526,60 +548,83 @@ class MessageRouter:
 
         Must be called with state_machine.lock held.
         Transitions: COLD -> STARTING -> HEALTHY -> ACTIVE.
+
+        On any abnormal exit — including asyncio.CancelledError — ensures
+        state == FAILED and _failure_time is set so FR-22.5 cooldown protection
+        applies. CancelledError is re-raised so the outer cancel scope can shut
+        down cleanly. Uses a _started flag + finally to handle CancelledError,
+        since CancelledError extends BaseException and bypasses bare `except Exception`.
         """
+        _completed = False
         try:
             await self._lifecycle.start()
-        except Exception:
-            self._failure_time = (time.monotonic(), FailureReason.START)
-            raise
 
-        # Connect transport
-        transport = self._transport_factory()
-        try:
-            await transport.connect()
-        except Exception as exc:
-            self._failure_time = (time.monotonic(), FailureReason.START)
-            await self._sm.transition(BackendState.FAILED)
-            raise LifecycleError(f"Failed to connect transport: {exc}") from exc
+            # Connect transport
+            transport = self._transport_factory()
+            try:
+                await transport.connect()
+            except Exception as exc:
+                self._failure_time = (time.monotonic(), FailureReason.START)
+                await self._sm.transition(BackendState.FAILED)
+                raise LifecycleError(f"Failed to connect transport: {exc}") from exc
 
-        self._transport = transport
+            self._transport = transport
 
-        # Perform MCP initialize handshake
-        internal_id = self._id_mapper.next_internal_id()
-        backend_capabilities: dict[str, Any] = {}
-        try:
-            init_result = await transport.request(
-                "initialize",
-                params={
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "mcp-standby-proxy",
-                        "version": "0.1.0",
+            # Perform MCP initialize handshake
+            internal_id = self._id_mapper.next_internal_id()
+            backend_capabilities: dict[str, Any] = {}
+            try:
+                init_result = await transport.request(
+                    "initialize",
+                    params={
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "mcp-standby-proxy",
+                            "version": "0.1.0",
+                        },
                     },
-                },
-                id=internal_id,
-            )
-            backend_capabilities = init_result.get("result", {}).get("capabilities", {})
-            await transport.notify("notifications/initialized")
+                    id=internal_id,
+                )
+                backend_capabilities = init_result.get("result", {}).get("capabilities", {})
+                await transport.notify("notifications/initialized")
+            except Exception as exc:
+                self._failure_time = (time.monotonic(), FailureReason.START)
+                await transport.close()
+                self._transport = None
+                await self._sm.transition(BackendState.FAILED)
+                raise LifecycleError(f"Failed MCP handshake: {exc}") from exc
+
+            # Cold bootstrap: fetch capabilities if no cache
+            cache_data = self._cache.load()
+            if cache_data is None:
+                await self._bootstrap_cache(transport, backend_capabilities)
+            elif not cache_data.get("capabilities"):
+                # Update capabilities in existing cache without re-fetching method lists
+                cache_data["capabilities"] = _resolve_capabilities(backend_capabilities, cache_data)
+                asyncio.create_task(self._cache.save(cache_data))
+
+            await self._sm.transition(BackendState.ACTIVE)
+            logger.info("[%s] Backend is active", self._config.server.name)
+            _completed = True
+
         except Exception as exc:
+            # Lifecycle.start() raised a non-BaseException. Wrap if not already LifecycleError.
             self._failure_time = (time.monotonic(), FailureReason.START)
-            await transport.close()
-            self._transport = None
-            await self._sm.transition(BackendState.FAILED)
-            raise LifecycleError(f"Failed MCP handshake: {exc}") from exc
-
-        # Cold bootstrap: fetch capabilities if no cache
-        cache_data = self._cache.load()
-        if cache_data is None:
-            await self._bootstrap_cache(transport, backend_capabilities)
-        elif not cache_data.get("capabilities"):
-            # Update capabilities in existing cache without re-fetching method lists
-            cache_data["capabilities"] = _resolve_capabilities(backend_capabilities, cache_data)
-            asyncio.create_task(self._cache.save(cache_data))
-
-        await self._sm.transition(BackendState.ACTIVE)
-        logger.info("[%s] Backend is active", self._config.server.name)
+            if not isinstance(exc, LifecycleError):
+                raise LifecycleError(f"Lifecycle start failed: {exc}") from exc
+            raise
+        finally:
+            # Guarantee state == FAILED on ANY abnormal exit — including CancelledError,
+            # which extends BaseException and bypasses `except Exception`. This ensures
+            # the FR-22.5 cooldown gate is armed even if lifecycle.start() is cancelled
+            # mid-flight (e.g. asyncio.wait_for timeout during retry).
+            #
+            # Awaiting inside finally while a CancelledError is propagating is safe in
+            # CPython: the CancelledError is "held" until finally completes, then re-raised.
+            if not _completed and self._sm.state not in (BackendState.FAILED, BackendState.ACTIVE):
+                self._failure_time = (time.monotonic(), FailureReason.START)
+                await self._sm_ensure_failed()
 
     async def _bootstrap_cache(
         self, transport: BackendTransport, capabilities: dict[str, Any] | None = None
@@ -609,6 +654,25 @@ class MessageRouter:
 
         asyncio.create_task(self._cache.save(cache))
         logger.info("[%s] Cache bootstrapped", self._config.server.name)
+
+    async def _sm_ensure_failed(self) -> None:
+        """Drive the state machine to FAILED from any non-terminal transient state.
+
+        Called by _do_start's finally block to guarantee FAILED state on abnormal exit,
+        including CancelledError. Valid transition paths from each possible state:
+          COLD     → STARTING → FAILED
+          STARTING → FAILED
+          HEALTHY  → FAILED
+          FAILED   → no-op (already there)
+          ACTIVE   → not expected here; no-op (caller checks before calling)
+        """
+        current = self._sm.state
+        if current == BackendState.COLD:
+            await self._sm.transition(BackendState.STARTING)
+            await self._sm.transition(BackendState.FAILED)
+        elif current in (BackendState.STARTING, BackendState.HEALTHY):
+            await self._sm.transition(BackendState.FAILED)
+        # FAILED, ACTIVE, STOPPING — no-op
 
     async def drain_queue(self) -> None:
         """Forward all queued requests to the backend and write responses."""

@@ -195,18 +195,22 @@ async def test_midsession_transport_error_transitions_to_failed(tmp_path: Path) 
     captured_failure_time: list[Any] = []
     original_detect = router._detect_transport_death
 
-    async def _patched_detect(method: str, exc: Exception) -> None:
-        await original_detect(method, exc)
+    async def _patched_detect(
+        method: str, exc: Exception, stale_transport: Any
+    ) -> None:
+        await original_detect(method, exc, stale_transport)
         captured_failure_time.append(router._failure_time)
 
     router._detect_transport_death = _patched_detect  # type: ignore[method-assign]
 
-    # Make the retry's lifecycle.start fail so the test terminates cleanly
+    # Make the retry's lifecycle.start fail so the test terminates cleanly.
+    # Mimic real LifecycleManager.start(): transition to STARTING then FAILED, then raise.
     async def _failing_start() -> None:
-        sm._state = BackendState.FAILED
+        await sm.transition(BackendState.STARTING)
+        await sm.transition(BackendState.FAILED)
         raise LifecycleError("restart intentionally failed for test")
 
-    router._lifecycle.start = AsyncMock(side_effect=_failing_start)
+    router._lifecycle.start = AsyncMock(side_effect=_failing_start)  # type: ignore[method-assign]
 
     await router.handle_message({
         "jsonrpc": "2.0",
@@ -291,12 +295,14 @@ async def test_retry_failure_propagates_lifecycle_error(tmp_path: Path) -> None:
     router, writer, sm = await _make_router(tmp_path, transport_factory=lambda: transport)
     await _force_active(router, sm)
 
-    # Make restart fail with LifecycleError
+    # Make restart fail with LifecycleError.
+    # Mimic real LifecycleManager.start(): transition to STARTING then FAILED, then raise.
     async def _failing_start() -> None:
-        sm._state = BackendState.FAILED
+        await sm.transition(BackendState.STARTING)
+        await sm.transition(BackendState.FAILED)
         raise LifecycleError("docker failed to start")
 
-    router._lifecycle.start = AsyncMock(side_effect=_failing_start)
+    router._lifecycle.start = AsyncMock(side_effect=_failing_start)  # type: ignore[method-assign]
 
     await router.handle_message({
         "jsonrpc": "2.0",
@@ -423,7 +429,7 @@ async def test_does_not_retry_twice_on_same_request(tmp_path: Path) -> None:
         await sm.transition(BackendState.HEALTHY)
 
     router, writer, sm = await _make_router(tmp_path, transport_factory=lambda: transport)
-    router._lifecycle.start = AsyncMock(side_effect=_counting_start)
+    router._lifecycle.start = AsyncMock(side_effect=_counting_start)  # type: ignore[method-assign]
     await _force_active(router, sm)
 
     initial_count = start_call_count
@@ -604,10 +610,13 @@ async def test_start_failure_keeps_10s_cooldown(tmp_path: Path) -> None:
     router, writer, sm = await _make_router(tmp_path)
 
     async def _failing_start() -> None:
-        sm._state = BackendState.FAILED
+        # Mimic real LifecycleManager.start(): transition to STARTING then FAILED, then raise.
+        # No manual sm._state cheating — transitions go through the state machine.
+        await sm.transition(BackendState.STARTING)
+        await sm.transition(BackendState.FAILED)
         raise LifecycleError("docker timeout")
 
-    router._lifecycle.start = AsyncMock(side_effect=_failing_start)
+    router._lifecycle.start = AsyncMock(side_effect=_failing_start)  # type: ignore[method-assign]
 
     await router.handle_message({
         "jsonrpc": "2.0",
@@ -661,12 +670,14 @@ async def test_tag_override_on_retry_do_start_failure(tmp_path: Path) -> None:
             await sm.transition(BackendState.STARTING)
             await sm.transition(BackendState.HEALTHY)
         else:
-            # Retry's _do_start — raises LifecycleError
-            sm._state = BackendState.FAILED
+            # Retry's _do_start — mimic real LifecycleManager: transition to STARTING then FAILED.
+            # No manual sm._state cheating — transitions go through the state machine.
+            await sm.transition(BackendState.STARTING)
+            await sm.transition(BackendState.FAILED)
             raise LifecycleError("restart failed")
 
     router, writer, sm = await _make_router(tmp_path, transport_factory=lambda: transport)
-    router._lifecycle.start = AsyncMock(side_effect=_start_that_fails_on_retry)
+    router._lifecycle.start = AsyncMock(side_effect=_start_that_fails_on_retry)  # type: ignore[method-assign]
     await _force_active(router, sm)
 
     await router.handle_message({
@@ -685,32 +696,66 @@ async def test_tag_override_on_retry_do_start_failure(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 12: concurrent failures — at most one _do_start per incident
+# Test 12: concurrent failures — exactly one _do_start per incident
 # ---------------------------------------------------------------------------
 
 
 async def test_concurrent_failures_serialize_one_restart(tmp_path: Path) -> None:
-    """FR-22.6: N=5 concurrent handlers all catch TransportError.
-    lifecycle.start must be called at most once by those handlers."""
-    N = 5
-    first_call = True
+    """FR-22.6: N=5 concurrent handlers all await request() on the same dying transport
+    simultaneously. After BLOCKING-1 fix (stale_transport identity check), exactly one
+    handler must trigger lifecycle.start; the rest must be no-ops.
 
-    class _SharedDyingTransport(_BaseTransport):
-        def __init__(self) -> None:
+    Uses asyncio.Event gates so all N tasks truly suspend inside request() at the
+    same time before the transport dies — this reproduces the real concurrent-death race
+    that the original test missed.
+
+    The transport_factory creates a NEW transport object each time _do_start() is called,
+    so the stale_transport identity check (`self._transport is not stale_transport`) can
+    distinguish the stale (pre-failure) transport from the fresh recovery transport.
+    """
+    N = 5
+    # Event that all N tasks wait for before request() proceeds to die
+    all_suspended = asyncio.Event()
+    release_gate = asyncio.Event()
+    suspended_count = 0
+    # After the gate is opened and the initial transport dies, subsequent calls succeed.
+    # This flag lives on the INITIAL transport instance, not shared across factory calls.
+
+    class _DyingTransport(_BaseTransport):
+        """Transport that participates in the gate scenario.
+
+        killed: if True, the NEXT tools/call suspends at the gate then dies.
+        """
+        def __init__(self, *, kill_on_call: bool = False) -> None:
             super().__init__()
+            self._kill_on_call = kill_on_call
 
         async def request(self, method: str, params: Any = None, id: Any = None) -> dict[str, Any]:
-            nonlocal first_call
-            if method == "tools/call":
-                if first_call:
-                    first_call = False
-                    raise TransportError("Write stream closed")
-                return {"result": {"content": []}, "id": id, "jsonrpc": "2.0"}
+            nonlocal suspended_count
+            if method == "tools/call" and self._kill_on_call:
+                suspended_count += 1
+                if suspended_count == N:
+                    all_suspended.set()
+                # All N tasks wait here simultaneously → true concurrent death
+                await release_gate.wait()
+                raise TransportError("Write stream closed")
             return await super().request(method, params, id)
 
-    shared_transport = _SharedDyingTransport()
+    # The initial transport (installed by _force_active) kills on tools/call.
+    # Factory creates a FRESH (non-killing) transport for recovery → distinct object.
+    initial_transport = _DyingTransport(kill_on_call=True)
+    transport_call_count = 0
 
-    # Count _do_start (lifecycle.start) invocations beyond the initial activation
+    def _factory() -> _DyingTransport:
+        nonlocal transport_call_count
+        transport_call_count += 1
+        if transport_call_count == 1:
+            # First call: return the initial (dying) transport
+            return initial_transport
+        # Subsequent calls (recovery): return a fresh transport that succeeds
+        return _DyingTransport(kill_on_call=False)
+
+    # Count lifecycle.start invocations beyond the initial activation
     start_count = 0
     initial_done = False
 
@@ -723,14 +768,13 @@ async def test_concurrent_failures_serialize_one_restart(tmp_path: Path) -> None
         await sm.transition(BackendState.STARTING)
         await sm.transition(BackendState.HEALTHY)
 
-    router, writer, sm = await _make_router(tmp_path, transport_factory=lambda: shared_transport)
-    router._lifecycle.start = AsyncMock(side_effect=_counting_start)
+    router, writer, sm = await _make_router(tmp_path, transport_factory=_factory)
+    router._lifecycle.start = AsyncMock(side_effect=_counting_start)  # type: ignore[method-assign]
     await _force_active(router, sm)
 
     start_count = 0  # Reset — only count retry starts
 
-    # Fire N concurrent requests — the first will die, the rest should either
-    # wait for the restart or also catch the stale transport error.
+    # Fire N concurrent tasks — all will suspend inside request() waiting for the gate
     tasks = [
         asyncio.create_task(
             router.handle_message({
@@ -742,16 +786,106 @@ async def test_concurrent_failures_serialize_one_restart(tmp_path: Path) -> None
         )
         for i in range(N)
     ]
+
+    # Wait until all N tasks are suspended inside transport.request()
+    await asyncio.wait_for(all_suspended.wait(), timeout=5.0)
+
+    # Release all N tasks simultaneously — they all raise TransportError at once
+    release_gate.set()
+
     await asyncio.gather(*tasks)
 
-    # Critical invariant: at most one lifecycle.start per incident
-    assert start_count <= 1, (
-        f"Expected at most 1 lifecycle.start call for N={N} concurrent failures, "
-        f"got {start_count}"
+    # Critical invariant: EXACTLY one lifecycle.start per incident.
+    # Before BLOCKING-1 fix this was N starts; after the fix it must be 1.
+    assert start_count == 1, (
+        f"Expected exactly 1 lifecycle.start call for N={N} concurrent failures, "
+        f"got {start_count}. BLOCKING-1 fix (stale_transport identity check) may be missing."
     )
 
     # All N handlers must have produced a response (success or error)
     assert len(writer.messages) == N
+
+
+# ---------------------------------------------------------------------------
+# Test 12b: timeout during lifecycle.start → FAILED state → cooldown blocks next request
+# ---------------------------------------------------------------------------
+
+
+async def test_start_timeout_leaves_failed_state_and_cooldown_applies(tmp_path: Path) -> None:
+    """BLOCKING-2: asyncio.wait_for cancels _do_start() mid-execution.
+    After the timeout, state must be FAILED (not COLD) and _failure_time must be set,
+    so a subsequent request within the cooldown window receives LifecycleError immediately
+    instead of re-entering _do_start() and hanging again.
+
+    This exercises the BaseException handler in _do_start that catches CancelledError.
+    """
+    # Use a transport that always dies so the initial request triggers the recovery retry
+    class _AlwaysDiesTransport(_BaseTransport):
+        async def request(self, method: str, params: Any = None, id: Any = None) -> dict[str, Any]:
+            if method == "tools/call":
+                raise TransportError("Write stream closed")
+            return await super().request(method, params, id)
+
+    transport = _AlwaysDiesTransport()
+    router, writer, sm = await _make_router(tmp_path, transport_factory=lambda: transport)
+    await _force_active(router, sm)
+
+    # Make restart hang "forever" so wait_for fires and cancels _do_start
+    async def _hanging_start() -> None:
+        await asyncio.sleep(9999)
+
+    router._lifecycle.start = AsyncMock(side_effect=_hanging_start)  # type: ignore[method-assign]
+
+    # Use a very short timeout to force fast failure
+    original_wait_for = asyncio.wait_for
+
+    async def _fast_wait_for(coro: Any, timeout: float) -> Any:
+        return await original_wait_for(coro, timeout=0.05)
+
+    with patch("mcp_standby_proxy.router.asyncio.wait_for", side_effect=_fast_wait_for):
+        await router.handle_message({
+            "jsonrpc": "2.0",
+            "id": 50,
+            "method": "tools/call",
+            "params": {"name": "t", "arguments": {}},
+        })
+
+    # State must be FAILED (not COLD) — BLOCKING-2 fix
+    assert sm.state == BackendState.FAILED, (
+        f"Expected FAILED state after timeout, got {sm.state}. "
+        "CancelledError must be caught in _do_start to guarantee FAILED state."
+    )
+
+    # _failure_time must be set (MIDSESSION — overwritten by retry-failure branch)
+    assert router._failure_time is not None, (
+        "_failure_time must be set after timeout — cooldown gate must be armed."
+    )
+
+    writer.messages.clear()
+
+    # Second request must be gated by cooldown and must NOT re-enter _do_start
+    t0 = asyncio.get_event_loop().time()
+    await router.handle_message({
+        "jsonrpc": "2.0",
+        "id": 51,
+        "method": "tools/call",
+        "params": {"name": "t", "arguments": {}},
+    })
+    elapsed = asyncio.get_event_loop().time() - t0
+
+    # Must return in < 500ms (not hang for another 9999s)
+    assert elapsed < 0.5, (
+        f"Second request took {elapsed:.2f}s — expected < 0.5s (cooldown gate). "
+        "Backend must not re-enter _do_start after a failed timeout."
+    )
+
+    assert len(writer.messages) == 1
+    err = writer.messages[0]
+    assert "error" in err
+    msg = err["error"]["message"]
+    assert "cooldown=" in msg, (
+        f"Expected 'cooldown=' in error message (cooldown gate). Got: {msg}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -911,23 +1045,28 @@ async def test_log_line_formats(tmp_path: Path, caplog: pytest.LogCaptureFixture
 
     records = caplog.records
 
-    # Detection WARNING
-    assert any(
-        r.levelno == logging.WARNING and "transport died during tools/call" in r.message
-        for r in records
-    ), f"Missing detection WARNING. Records: {[(r.levelno, r.message) for r in records]}"
+    server_name = "test-server"  # matches _make_config()
 
-    # Retry start INFO
+    # Detection WARNING — exact match against the format string produced by router.py
     assert any(
-        r.levelno == logging.INFO and "restarting backend after mid-session transport death" in r.message
+        r.levelno == logging.WARNING
+        and r.getMessage() == f"[{server_name}] transport died during tools/call: Write stream closed"
         for r in records
-    ), f"Missing retry-start INFO. Records: {[(r.levelno, r.message) for r in records]}"
+    ), f"Missing detection WARNING. Records: {[(r.levelno, r.getMessage()) for r in records]}"
 
-    # Recovery success INFO
+    # Retry start INFO — exact match
     assert any(
-        r.levelno == logging.INFO and "transport recovered; tools/call succeeded" in r.message
+        r.levelno == logging.INFO
+        and r.getMessage() == f"[{server_name}] restarting backend after mid-session transport death"
         for r in records
-    ), f"Missing recovery-success INFO. Records: {[(r.levelno, r.message) for r in records]}"
+    ), f"Missing retry-start INFO. Records: {[(r.levelno, r.getMessage()) for r in records]}"
+
+    # Recovery success INFO — exact match
+    assert any(
+        r.levelno == logging.INFO
+        and r.getMessage() == f"[{server_name}] transport recovered; tools/call succeeded"
+        for r in records
+    ), f"Missing recovery-success INFO. Records: {[(r.levelno, r.getMessage()) for r in records]}"
 
     # --- Part B: retry failure WARNING ---
     caplog.clear()
@@ -950,8 +1089,9 @@ async def test_log_line_formats(tmp_path: Path, caplog: pytest.LogCaptureFixture
             "params": {"name": "t", "arguments": {}},
         })
 
-    # Retry failure WARNING
+    # Retry failure WARNING — exact prefix match (exception text varies by failure path)
     assert any(
-        r.levelno == logging.WARNING and "transport recovery failed" in r.message
+        r.levelno == logging.WARNING
+        and r.getMessage().startswith(f"[{server_name}] transport recovery failed: ")
         for r in caplog.records
-    ), f"Missing retry-failure WARNING. Records: {[(r.levelno, r.message) for r in caplog.records]}"
+    ), f"Missing retry-failure WARNING. Records: {[(r.levelno, r.getMessage()) for r in caplog.records]}"

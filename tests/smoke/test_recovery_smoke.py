@@ -20,6 +20,7 @@ import socket
 import time
 from io import BytesIO
 from pathlib import Path
+from collections.abc import Callable, Coroutine
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -49,7 +50,8 @@ from mcp_standby_proxy.state import BackendState, StateMachine
 def _get_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+        port: int = s.getsockname()[1]
+        return port
 
 
 class _CollectingWriter(JsonRpcWriter):
@@ -113,11 +115,14 @@ class _SimulatedTransport:
       the transport 'dies' and when it recovers.
     """
 
+    # Type alias for the tools/call handler callback
+    _ToolsCallHandler = Callable[[Any], Coroutine[Any, Any, "dict[str, Any]"]]
+
     def __init__(self) -> None:
         self._connected = False
         self.connect_count = 0
         self.request_count = 0
-        self._tools_call_handler: Any = None  # overridden by tests
+        self._tools_call_handler: "_SimulatedTransport._ToolsCallHandler | None" = None
 
     async def connect(self) -> None:
         self._connected = True
@@ -128,7 +133,8 @@ class _SimulatedTransport:
         if method == "initialize":
             return {"result": {"capabilities": {"tools": {}}}, "id": id, "jsonrpc": "2.0"}
         if method in ("tools/list", "resources/list", "prompts/list"):
-            return {"result": {method.split("/")[0]: [{"name": "echo"}] if method == "tools/list" else []}, "id": id, "jsonrpc": "2.0"}
+            result: list[Any] = [{"name": "echo"}] if method == "tools/list" else []
+            return {"result": {method.split("/")[0]: result}, "id": id, "jsonrpc": "2.0"}
         if method == "tools/call" and self._tools_call_handler is not None:
             return await self._tools_call_handler(id)
         return {"result": {"content": [{"type": "text", "text": "ok"}]}, "id": id, "jsonrpc": "2.0"}
@@ -282,27 +288,73 @@ async def test_recovery_kill_between_calls(tmp_path: Path) -> None:
 @pytest.mark.smoke
 @pytest.mark.parametrize("n_concurrent", [5, 10])
 async def test_recovery_dedup_N(tmp_path: Path, n_concurrent: int) -> None:
-    """Test 17: N concurrent tools/call when transport is dead → lifecycle.start once.
+    """Test 17: N concurrent tools/call while transport is dying → lifecycle.start exactly once.
 
-    Simulates N concurrent handlers hitting a stale transport simultaneously.
-    Only one should trigger _do_start(); the rest wait for ACTIVE state.
+    Uses a simulated transport factory that creates NEW transport objects per _do_start(),
+    so the stale_transport identity check (`self._transport is not stale_transport`) works
+    correctly. All N tasks suspend simultaneously in request(), then all die at once.
+    Exactly one must trigger _do_start(); the rest must see the recovery and piggyback.
+
+    Note on FastMCP: the anyio cancel-scope constraint (same as test 16) prevents using
+    a real StreamableHttpTransport here — close() called from the recovery task's context
+    fails when the original connect() context is still active. The router deduplication
+    logic is transport-layer-agnostic and is adequately exercised with a simulated transport
+    that creates distinct objects per factory call, matching the production behavior.
     """
-    transport = _SimulatedTransport()
-    first_call = True
+    # Gate ensures all N tasks are truly suspended in request() simultaneously
+    all_suspended = asyncio.Event()
+    release_gate = asyncio.Event()
+    suspended_count = 0
 
-    async def _tools_call_handler(id: Any) -> dict[str, Any]:
-        nonlocal first_call
-        if first_call:
-            first_call = False
-            raise TransportError("Write stream closed")
-        return {"result": {"content": []}, "id": id, "jsonrpc": "2.0"}
+    class _GatedTransport(_SimulatedTransport):
+        """Transport that blocks all tools/call requests at a gate, then dies."""
 
-    transport._tools_call_handler = _tools_call_handler
+        def __init__(self, *, kill_on_call: bool) -> None:
+            super().__init__()
+            self._kill = kill_on_call
+
+        async def request(self, method: str, params: Any = None, id: Any = None) -> dict[str, Any]:
+            nonlocal suspended_count
+            if method == "tools/call" and self._kill:
+                suspended_count += 1
+                if suspended_count == n_concurrent:
+                    all_suspended.set()
+                await release_gate.wait()
+                raise TransportError("Write stream closed")
+            return await super().request(method, params, id)
+
+    # First factory call (from _force_active) returns the dying transport.
+    # Subsequent calls (from recovery _do_start) return fresh surviving transports.
+    # This distinct-object-per-call pattern matches production StreamableHttpTransport.
+    factory_call_count = 0
+    dying_transport = _GatedTransport(kill_on_call=True)
+
+    def _transport_factory() -> _GatedTransport:
+        nonlocal factory_call_count
+        factory_call_count += 1
+        if factory_call_count == 1:
+            return dying_transport
+        return _GatedTransport(kill_on_call=False)  # recovery transport — succeeds
 
     restart_count = 0
     initial_done = False
 
-    router, writer, sm, mock_lifecycle = _make_router(tmp_path, transport)
+    sm = StateMachine()
+    writer = _CollectingWriter()
+
+    config = ProxyConfig(
+        version=1,
+        server=ServerConfig(name="smoke-server", version="1.0.0"),
+        backend=BackendConfig(transport=BackendTransportEnum.SSE, url="http://127.0.0.1:9999/sse"),
+        lifecycle=LifecycleConfig(
+            start=LifecycleCommandConfig(command="true", timeout=10),
+            stop=LifecycleCommandConfig(command="true", timeout=5),
+            healthcheck=HealthcheckConfig(type=HealthcheckType.COMMAND, command="true", interval=1, max_attempts=1, timeout=1),
+        ),
+        cache=CacheConfig(path=str(tmp_path / "cache.json")),
+    )
+    cache_manager = CacheManager(tmp_path / "cache.json")
+    mock_lifecycle = MagicMock(spec=LifecycleManager)
 
     async def _counting_start() -> None:
         nonlocal restart_count, initial_done
@@ -314,8 +366,18 @@ async def test_recovery_dedup_N(tmp_path: Path, n_concurrent: int) -> None:
         await sm.transition(BackendState.HEALTHY)
 
     mock_lifecycle.start = AsyncMock(side_effect=_counting_start)
-    await _force_active(router, sm)
+    mock_lifecycle.stop = AsyncMock()
 
+    router = MessageRouter(
+        config=config,
+        state_machine=sm,
+        lifecycle_manager=mock_lifecycle,
+        cache_manager=cache_manager,
+        transport_factory=_transport_factory,
+        writer=writer,
+    )
+
+    await _force_active(router, sm)
     restart_count = 0  # Reset — only count restarts, not initial activation
     writer.messages.clear()
 
@@ -330,11 +392,18 @@ async def test_recovery_dedup_N(tmp_path: Path, n_concurrent: int) -> None:
         )
         for i in range(n_concurrent)
     ]
+
+    # Wait until all N concurrent requests are suspended in transport.request()
+    await asyncio.wait_for(all_suspended.wait(), timeout=5.0)
+
+    # Kill the transport simultaneously for all N tasks
+    release_gate.set()
+
     await asyncio.gather(*tasks)
 
-    assert restart_count <= 1, (
-        f"Expected at most 1 lifecycle.start for N={n_concurrent} concurrent failures, "
-        f"got {restart_count} (FR-22.6)"
+    assert restart_count == 1, (
+        f"Expected exactly 1 lifecycle.start for N={n_concurrent} concurrent failures, "
+        f"got {restart_count} (FR-22.6). BLOCKING-1 stale_transport identity check required."
     )
 
     assert len(writer.messages) == n_concurrent, (
