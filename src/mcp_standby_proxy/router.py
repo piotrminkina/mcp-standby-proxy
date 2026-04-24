@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from mcp_standby_proxy.cache import CacheData, CacheManager
 from mcp_standby_proxy.config import ProxyConfig
-from mcp_standby_proxy.errors import LifecycleError, TransportError
+from mcp_standby_proxy.errors import FailureReason, LifecycleError, TransportError
 from mcp_standby_proxy.jsonrpc import (
     INTERNAL_ERROR,
     METHOD_NOT_FOUND,
@@ -22,8 +22,9 @@ from mcp_standby_proxy.transport.base import BackendTransport
 
 logger = logging.getLogger(__name__)
 
-# Cooldown in seconds before retrying a failed backend
-FAILURE_COOLDOWN = 10.0
+# Cooldown in seconds before retrying a failed backend — split by failure reason (FR-22.5)
+FAILURE_COOLDOWN_START = 10.0       # preserves prior behavior for start-time failures
+FAILURE_COOLDOWN_MIDSESSION = 5.0   # shorter window for mid-session transport deaths
 
 # Methods that are served from cache or locally without backend
 _CACHED_METHODS = frozenset(["tools/list", "resources/list", "prompts/list"])
@@ -82,7 +83,7 @@ class MessageRouter:
         self._transport: BackendTransport | None = None
         self._id_mapper = IdMapper()
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._failure_time: float | None = None
+        self._failure_time: tuple[float, FailureReason] | None = None
         self._initialized = False
 
     async def handle_message(self, message: dict[str, Any]) -> None:
@@ -117,6 +118,10 @@ class MessageRouter:
                 try:
                     await self._transport.notify(method, message.get("params"))
                 except TransportError as exc:
+                    # Mid-session transport death on a notification path (FR-22.4).
+                    # Transition to FAILED under lock; no retry (notifications are fire-and-forget).
+                    await self._detect_transport_death(method, exc)
+                except Exception as exc:
                     logger.warning(
                         "[%s] Failed to forward notification: %s",
                         self._config.server.name,
@@ -196,7 +201,78 @@ class MessageRouter:
             new_cache[method] = actual_result
             asyncio.create_task(self._cache.save(new_cache))
 
-        except (TransportError, Exception) as exc:
+        except TransportError as exc:
+            # Mid-session transport death — attempt single inline recovery (FR-22.2)
+            await self._detect_transport_death(method, exc)
+            timeout = min(self._config.lifecycle.start.timeout, 60.0)
+
+            async def _cacheable_retry() -> dict[str, Any]:
+                logger.info(
+                    "[%s] restarting backend after mid-session transport death",
+                    self._config.server.name,
+                )
+                await self.ensure_active()
+                assert self._transport is not None
+                retry_internal_id = self._id_mapper.next_internal_id()
+                return await self._transport.request(method, id=retry_internal_id)
+
+            try:
+                retry_result = await asyncio.wait_for(_cacheable_retry(), timeout=timeout)
+                actual_result = retry_result.get("result", {})
+                await self._writer.write_message(make_response(id=msg_id, result=actual_result))
+                logger.info(
+                    "[%s] transport recovered; %s succeeded",
+                    self._config.server.name,
+                    method,
+                )
+
+                cache_data = self._cache.load()
+                new_cache = CacheData(cache_version=1)
+                if cache_data:
+                    new_cache.update(cache_data)
+                new_cache["capabilities"] = new_cache.get("capabilities") or dict(_DEFAULT_CAPABILITIES)
+                new_cache[method] = actual_result
+                asyncio.create_task(self._cache.save(new_cache))
+
+            except LifecycleError as retry_exc:
+                self._failure_time = (time.monotonic(), FailureReason.MIDSESSION)
+                error_msg = f"transport died during {method}; restart failed: {retry_exc}"
+                logger.warning(
+                    "[%s] transport recovery failed: %s", self._config.server.name, retry_exc
+                )
+                await self._writer.write_message(
+                    make_error(id=msg_id, code=INTERNAL_ERROR, message=error_msg)
+                )
+            except TransportError as retry_exc:
+                self._failure_time = (time.monotonic(), FailureReason.MIDSESSION)
+                error_msg = f"transport died during {method}; retry after restart also failed: {retry_exc}"
+                logger.warning(
+                    "[%s] transport recovery failed: %s", self._config.server.name, retry_exc
+                )
+                await self._writer.write_message(
+                    make_error(id=msg_id, code=INTERNAL_ERROR, message=error_msg)
+                )
+            except asyncio.TimeoutError:
+                self._failure_time = (time.monotonic(), FailureReason.MIDSESSION)
+                error_msg = f"transport died during {method}; restart failed: timed out after {timeout:.1f}s"
+                logger.warning(
+                    "[%s] transport recovery failed: timed out after %.1fs",
+                    self._config.server.name,
+                    timeout,
+                )
+                await self._writer.write_message(
+                    make_error(id=msg_id, code=INTERNAL_ERROR, message=error_msg)
+                )
+            except Exception as retry_exc:
+                self._failure_time = (time.monotonic(), FailureReason.MIDSESSION)
+                logger.warning(
+                    "[%s] transport recovery failed: %s", self._config.server.name, retry_exc
+                )
+                await self._writer.write_message(
+                    make_error(id=msg_id, code=INTERNAL_ERROR, message=str(retry_exc))
+                )
+
+        except Exception as exc:
             logger.error("[%s] Failed to fetch %s: %s", self._config.server.name, method, exc)
             await self._writer.write_message(
                 make_error(id=msg_id, code=INTERNAL_ERROR, message=str(exc))
@@ -244,7 +320,91 @@ class MessageRouter:
                         data=err.get("data"),
                     )
                 )
-        except (TransportError, Exception) as exc:
+
+        except TransportError as exc:
+            # Mid-session transport death — recover original_id then attempt single inline recovery (FR-22.2).
+            # unwrap() is destructive; call it exactly once here, before the recovery path.
+            try:
+                original_id = self._id_mapper.unwrap(proxy_id)
+            except KeyError:
+                original_id = msg_id
+
+            await self._detect_transport_death(method, exc)
+            timeout = min(self._config.lifecycle.start.timeout, 60.0)
+
+            async def _forwarded_retry() -> dict[str, Any]:
+                logger.info(
+                    "[%s] restarting backend after mid-session transport death",
+                    self._config.server.name,
+                )
+                await self.ensure_active()
+                assert self._transport is not None
+                retry_proxy_id = self._id_mapper.wrap(msg_id)
+                result = await self._transport.request(method, message.get("params"), id=retry_proxy_id)
+                self._id_mapper.unwrap(retry_proxy_id)
+                return result
+
+            try:
+                retry_result = await asyncio.wait_for(_forwarded_retry(), timeout=timeout)
+                logger.info(
+                    "[%s] transport recovered; %s succeeded",
+                    self._config.server.name,
+                    method,
+                )
+                if "result" in retry_result:
+                    await self._writer.write_message(
+                        make_response(id=original_id, result=retry_result["result"])
+                    )
+                elif "error" in retry_result:
+                    err = retry_result["error"]
+                    await self._writer.write_message(
+                        make_error(
+                            id=original_id,
+                            code=err.get("code", INTERNAL_ERROR),
+                            message=err.get("message", "Backend error"),
+                            data=err.get("data"),
+                        )
+                    )
+
+            except LifecycleError as retry_exc:
+                self._failure_time = (time.monotonic(), FailureReason.MIDSESSION)
+                error_msg = f"transport died during {method}; restart failed: {retry_exc}"
+                logger.warning(
+                    "[%s] transport recovery failed: %s", self._config.server.name, retry_exc
+                )
+                await self._writer.write_message(
+                    make_error(id=original_id, code=INTERNAL_ERROR, message=error_msg)
+                )
+            except TransportError as retry_exc:
+                self._failure_time = (time.monotonic(), FailureReason.MIDSESSION)
+                error_msg = f"transport died during {method}; retry after restart also failed: {retry_exc}"
+                logger.warning(
+                    "[%s] transport recovery failed: %s", self._config.server.name, retry_exc
+                )
+                await self._writer.write_message(
+                    make_error(id=original_id, code=INTERNAL_ERROR, message=error_msg)
+                )
+            except asyncio.TimeoutError:
+                self._failure_time = (time.monotonic(), FailureReason.MIDSESSION)
+                error_msg = f"transport died during {method}; restart failed: timed out after {timeout:.1f}s"
+                logger.warning(
+                    "[%s] transport recovery failed: timed out after %.1fs",
+                    self._config.server.name,
+                    timeout,
+                )
+                await self._writer.write_message(
+                    make_error(id=original_id, code=INTERNAL_ERROR, message=error_msg)
+                )
+            except Exception as retry_exc:
+                self._failure_time = (time.monotonic(), FailureReason.MIDSESSION)
+                logger.warning(
+                    "[%s] transport recovery failed: %s", self._config.server.name, retry_exc
+                )
+                await self._writer.write_message(
+                    make_error(id=original_id, code=INTERNAL_ERROR, message=str(retry_exc))
+                )
+
+        except Exception as exc:
             try:
                 original_id = self._id_mapper.unwrap(proxy_id)
             except KeyError:
@@ -255,6 +415,37 @@ class MessageRouter:
             await self._writer.write_message(
                 make_error(id=original_id, code=INTERNAL_ERROR, message=str(exc))
             )
+
+    async def _detect_transport_death(self, method: str, exc: Exception) -> None:
+        """Transition ACTIVE → FAILED on mid-session transport death (FR-22.1).
+
+        Must be called immediately after catching TransportError from transport.request()
+        or transport.notify(). _failure_time is intentionally NOT set here — the cooldown
+        write point is the retry-failure branch, so the retry's ensure_active() does not
+        trip the cooldown gate before _do_start() runs.
+        """
+        async with self._sm.lock:
+            if self._sm.state == BackendState.ACTIVE:
+                await self._sm.transition(BackendState.FAILED)
+            # Close transport unconditionally — regardless of who made the ACTIVE→FAILED
+            # transition, we need to clear the stale reference. All of this must be
+            # under one lock acquisition to close the TOCTOU window.
+            if self._transport is not None:
+                try:
+                    await self._transport.close()
+                except Exception as close_exc:
+                    logger.debug(
+                        "[%s] Secondary exception while closing dead transport: %s",
+                        self._config.server.name,
+                        close_exc,
+                    )
+                self._transport = None
+        logger.warning(
+            "[%s] transport died during %s: %s",
+            self._config.server.name,
+            method,
+            exc,
+        )
 
     _BACKEND_METHODS = frozenset({
         "tools/call", "resources/read", "resources/subscribe",
@@ -305,13 +496,19 @@ class MessageRouter:
                         continue
 
                     if locked_state == BackendState.FAILED:
-                        # Check cooldown before reset
+                        # Check cooldown before reset — reason determines the window (FR-22.5)
                         if self._failure_time is not None:
-                            elapsed = time.monotonic() - self._failure_time
-                            if elapsed < FAILURE_COOLDOWN:
+                            elapsed = time.monotonic() - self._failure_time[0]
+                            reason = self._failure_time[1]
+                            cooldown = (
+                                FAILURE_COOLDOWN_MIDSESSION
+                                if reason == FailureReason.MIDSESSION
+                                else FAILURE_COOLDOWN_START
+                            )
+                            if elapsed < cooldown:
                                 raise LifecycleError(
                                     f"Backend failed recently ({elapsed:.1f}s ago, "
-                                    f"cooldown={FAILURE_COOLDOWN}s)"
+                                    f"cooldown={cooldown}s)"
                                 )
                         # FAILED → COLD → STARTING all under the same lock
                         await self._sm.transition(BackendState.COLD)
@@ -333,7 +530,7 @@ class MessageRouter:
         try:
             await self._lifecycle.start()
         except Exception:
-            self._failure_time = time.monotonic()
+            self._failure_time = (time.monotonic(), FailureReason.START)
             raise
 
         # Connect transport
@@ -341,7 +538,7 @@ class MessageRouter:
         try:
             await transport.connect()
         except Exception as exc:
-            self._failure_time = time.monotonic()
+            self._failure_time = (time.monotonic(), FailureReason.START)
             await self._sm.transition(BackendState.FAILED)
             raise LifecycleError(f"Failed to connect transport: {exc}") from exc
 
@@ -366,7 +563,7 @@ class MessageRouter:
             backend_capabilities = init_result.get("result", {}).get("capabilities", {})
             await transport.notify("notifications/initialized")
         except Exception as exc:
-            self._failure_time = time.monotonic()
+            self._failure_time = (time.monotonic(), FailureReason.START)
             await transport.close()
             self._transport = None
             await self._sm.transition(BackendState.FAILED)

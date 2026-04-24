@@ -1,3 +1,16 @@
+from enum import Enum
+
+
+class FailureReason(Enum):
+    """Distinguishes why the backend entered the Failed state.
+
+    Used to select the appropriate cooldown window (FR-22.5).
+    """
+
+    START = "start"
+    MIDSESSION = "midsession"
+
+
 class ProxyError(Exception):
     """Base exception for all proxy errors."""
 

@@ -10,9 +10,9 @@ from mcp_standby_proxy.cache import CacheManager
 from mcp_standby_proxy.config import load_config
 from mcp_standby_proxy.jsonrpc import JsonRpcWriter
 from mcp_standby_proxy.lifecycle import LifecycleManager
-from mcp_standby_proxy.router import FAILURE_COOLDOWN, MessageRouter
+from mcp_standby_proxy.errors import FailureReason, LifecycleError
+from mcp_standby_proxy.router import FAILURE_COOLDOWN_START, MessageRouter
 from mcp_standby_proxy.state import BackendState, StateMachine
-from mcp_standby_proxy.errors import LifecycleError
 
 
 def _make_config(tmp_path: Path):
@@ -92,9 +92,9 @@ async def test_ensure_active_within_cooldown_raises(tmp_path) -> None:
     """ensure_active() within FAILURE_COOLDOWN seconds of failure raises LifecycleError."""
     router, sm, lifecycle, writer = _make_router_and_deps(tmp_path)
 
-    # Simulate a recent failure
+    # Simulate a recent failure (START reason uses 10s cooldown)
     sm._state = BackendState.FAILED
-    router._failure_time = time.monotonic()  # just now
+    router._failure_time = (time.monotonic(), FailureReason.START)  # just now
 
     try:
         await router.ensure_active()
@@ -107,9 +107,9 @@ async def test_ensure_active_after_cooldown_retries(tmp_path) -> None:
     """ensure_active() after cooldown resets to COLD and allows restart."""
     router, sm, lifecycle, writer = _make_router_and_deps(tmp_path)
 
-    # Simulate an old failure (beyond cooldown)
+    # Simulate an old failure (beyond START cooldown)
     sm._state = BackendState.FAILED
-    router._failure_time = time.monotonic() - (FAILURE_COOLDOWN + 1)
+    router._failure_time = (time.monotonic() - (FAILURE_COOLDOWN_START + 1), FailureReason.START)
 
     await router.ensure_active()
     assert sm.state == BackendState.ACTIVE
@@ -155,6 +155,8 @@ async def test_proxy_runner_shutdown_event_can_be_set(tmp_path) -> None:
     assert runner._shutdown_event.is_set()
 
 
-async def test_router_cooldown_constant_is_10_seconds() -> None:
-    """Verify cooldown constant matches spec (10 seconds)."""
-    assert FAILURE_COOLDOWN == 10.0
+async def test_router_cooldown_constants_match_spec() -> None:
+    """Verify cooldown constants match spec (FR-22.5): START=10s, MIDSESSION=5s."""
+    from mcp_standby_proxy.router import FAILURE_COOLDOWN_MIDSESSION, FAILURE_COOLDOWN_START
+    assert FAILURE_COOLDOWN_START == 10.0
+    assert FAILURE_COOLDOWN_MIDSESSION == 5.0

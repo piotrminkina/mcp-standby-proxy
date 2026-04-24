@@ -83,7 +83,7 @@ intention of using those tools in the current session.
 | FR-19 | Stderr logging contract | MVP | implemented |
 | FR-20 | MCP protocol version handling | MVP | implemented (pass-through) |
 | FR-21 | Optional file logging for agent-mode diagnostics | MVP | implemented |
-| FR-22 | Transport liveness recovery (mid-session death detection + inline retry) | MVP | proposed |
+| FR-22 | Transport liveness recovery (mid-session death detection + inline retry) | MVP | implemented |
 
 ### FR-1: Cached schema serving (MVP)
 
