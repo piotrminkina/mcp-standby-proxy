@@ -83,6 +83,7 @@ intention of using those tools in the current session.
 | FR-19 | Stderr logging contract | MVP | implemented |
 | FR-20 | MCP protocol version handling | MVP | implemented (pass-through) |
 | FR-21 | Optional file logging for agent-mode diagnostics | MVP | implemented |
+| FR-22 | Transport liveness recovery (mid-session death detection + inline retry) | MVP | proposed |
 
 ### FR-1: Cached schema serving (MVP)
 
@@ -497,6 +498,73 @@ introducing telemetry infrastructure.
   collect the backend's stderr separately (e.g., redirect at the backend
   entry point).
 
+### FR-22: Mid-session backend recovery (MVP)
+
+When a backend's transport connection fails after the backend has reached
+`Active`, the proxy MUST detect the failure, restart the backend, and
+retry the originating client request transparently — so a user whose
+backend was killed externally (container restart, `docker compose stop`,
+crash) does NOT have to restart the MCP client to recover.
+
+**Status quo before FR-22:** on mid-session transport error the state
+machine remains in `ACTIVE`; every subsequent client request hits the
+stale transport and fails identically (with `Write stream closed` or
+`Stream error: incomplete chunked read`) until the MCP client restarts
+the proxy subprocess. Tech Spec §5.1 documented the intended
+`Active → Failed` transition but the shipped code never implemented it.
+FR-22 closes that gap — it is NOT a new feature, it is implementation
+of an already-approved contract.
+
+Design details — lock discipline, id remap, cooldown write points, error
+classification, test plan — are in [Tech Spec §5.5](tech-spec.md).
+
+**Sub-requirements:**
+
+- FR-22.1: The proxy MUST detect a mid-session transport failure when
+  a client-driven `request` or `notify` raises a transport error, and
+  MUST mark the backend failed such that the next `ensure_active()`
+  triggers a fresh `Cold → Starting → Active` cycle.
+- FR-22.2: A forwarded backend request (any method handled by
+  `_handle_forwarded_request` — `tools/call`, `resources/read`,
+  `prompts/get`, `sampling/createMessage`, etc.) or a cacheable
+  request (`*/list`) whose underlying `transport.request()` fails
+  due to mid-session transport death MUST be retried exactly once.
+  On retry success, the client receives a success response with its
+  original id. On retry failure, the client receives a JSON-RPC
+  `-32603` (INTERNAL_ERROR) whose message distinguishes "restart
+  failed" from "second transport failure after successful restart".
+- FR-22.3: Total recovery wall time (detection → restart → retry send)
+  MUST NOT exceed `min(lifecycle.start.timeout, 60s)`. On timeout the
+  client sees the retry-failure error path. Rationale: typical MCP
+  clients have per-tool-call timeouts in the 60 s range; exceeding
+  the bound produces an orphan retry that the client has already given
+  up on.
+- FR-22.4: Notifications (no response expected) trigger the same
+  state transition as requests but MUST NOT be retried. A WARNING log
+  is the operator's only breadcrumb of the dropped notification.
+- FR-22.5: The proxy MUST apply a cooldown between restart attempts
+  to prevent retry storms under repeated client requests against a
+  persistently broken backend. Cooldowns are split by failure reason:
+  **mid-session failure: 5 s**; **start-time failure (`lifecycle.start`
+  or handshake raised): 10 s** (existing value preserved). The cooldown
+  MUST NOT gate the first retry of a mid-session incident — it applies
+  only to subsequent client requests arriving after an already-exhausted
+  retry.
+- FR-22.6: Concurrent client requests that fail from the same backend
+  death MUST result in at most **one** `lifecycle.start` command
+  invocation. Verified by smoke test for N ∈ {1, 5, 10} concurrent
+  in-flight requests at time of death.
+- FR-22.7: Mid-session detection, retry start, successful recovery, and
+  retry failure MUST each emit a log line at WARNING or INFO level so
+  they appear in default logging (`-v` stderr and FR-21 file channel at
+  default `info` level).
+
+**Scope:** Applies only to backends that have reached `Active` at least
+once. Active/background liveness probing remains out of scope (§4).
+Failures that occur **inside** a restart attempt (`transport.connect()`,
+MCP `initialize` handshake) are already handled by the existing
+`Starting → Failed` path (FR-6.4) and are not re-retried by FR-22.2.
+
 ## 4. Project Scope Boundaries
 
 ### In scope (MVP)
@@ -514,6 +582,7 @@ introducing telemetry infrastructure.
 - Stderr logging contract (FR-19)
 - MCP protocol version pass-through (FR-20)
 - Optional file logging for agent-mode diagnostics (FR-21)
+- Transport liveness recovery — passive detection + single inline retry (FR-22)
 
 ### In scope (post-MVP phase 1)
 
@@ -554,10 +623,20 @@ Permanent non-goals (not "post-MVP"; not on the roadmap):
   intended for human reading, produced with the same formatter as stderr.
   Anything that requires a client library, a remote endpoint, or a parseable
   schema is out of scope.
-- **Auto-reconnection on transport flaps.** The current Failed → cooldown → Cold
-  → restart-on-next-call pattern covers the common case; MCP clients retry
-  failed requests, so a brief disconnect manifests as one extra round-trip. If
-  production usage proves this insufficient, promote to a post-MVP feature then.
+- **Active/background liveness probing.** A background task that polls the
+  transport or re-runs the healthcheck at a regular interval to proactively
+  detect disconnection before a client request hits the dead transport.
+  FR-22 implements *passive* detection (on `TransportError` surfaced from a
+  client-driven call) plus a single inline retry; an active probe is a
+  different design that adds a new task to the concurrency model and would
+  duplicate healthcheck configuration semantics. Revisit if users report
+  the first post-death call still failing unacceptably often despite FR-22.
+  (The earlier version of this line — "Auto-reconnection on transport
+  flaps, rely on MCP client retry" — rested on two false assumptions
+  invalidated in 2026-04: (a) the code in fact left state at `ACTIVE`
+  after a dead-transport error, so no restart-on-next-call ever fired, and
+  (b) the primary target client Claude Code does not auto-retry failed
+  tool calls. FR-22 corrects both.)
 
 ## 5. User Stories
 
@@ -705,6 +784,77 @@ Acceptance criteria:
 - A resolved log file path is announced on stderr at startup via a direct
   `sys.stderr.write` (not a `logging.INFO` record, so it appears regardless
   of `-v`/`-vv`). Exact format: `file logging enabled: path=<absolute-path>`.
+
+---
+
+**US-021: Backend death mid-session recovers transparently (FR-22)**
+
+As a developer whose backend was killed externally (container restart,
+`docker compose stop`, OOM, manual intervention) while the proxy session
+was active, I want my next MCP tool call to succeed automatically so that
+I don't have to restart my MCP client to recover.
+
+Acceptance criteria:
+- Setup: proxy has reached `Active`; backend is running; client has made
+  at least one successful `tools/call`.
+- Kill the backend externally (e.g., `docker kill` of the SSE container).
+- Client issues a subsequent `tools/call` via the proxy.
+- Proxy catches `TransportError`, transitions state machine to
+  `FAILED` (tagged `midsession`), clears the transport pointer, restarts
+  the backend via `ensure_active()`, and retries the request with a
+  fresh internal id.
+- Client receives the successful response with its original id.
+- Wall-time bound: `lifecycle.start.timeout + single request time`
+  (typically ~15-20s for a docker-compose-backed stack).
+- Log (stderr + FR-21 file channel if enabled) shows the three INFO/WARNING
+  breadcrumbs from FR-22.7: detected, restarting, recovered.
+- Regression invariant: if FR-22 is disabled in code, the same scenario
+  produces "Write stream closed" or "Stream error: incomplete chunked
+  read" as today — confirming the fix is localized.
+
+---
+
+**US-022: Concurrent calls during backend death share a single restart (FR-22)**
+
+As a developer whose MCP client issues multiple `tools/call`s in parallel
+(common when the agent batches tool uses), I want a single backend death
+to trigger at most one backend restart even if all parallel requests
+detect the death simultaneously.
+
+Acceptance criteria:
+- Setup: N > 1 concurrent `tools/call`s in flight; backend dies (external
+  SIGKILL of the container).
+- All N requests catch `TransportError` and enter recovery.
+- `lifecycle.start.command` is invoked exactly **once** per death event,
+  not N times. (Verifiable via smoke test instrumenting the subprocess
+  launcher, or via a logging counter.)
+- All N requests resolve to one of: successful response (after the single
+  restart) or `INTERNAL_ERROR` if the restart failed. None trigger an
+  independent second restart.
+- `self._transport` is never read by a second handler after a first has
+  cleared it (dedup invariant — FR-22.6).
+
+---
+
+**US-023: Persistently broken backend fails fast with a cooldown (FR-22)**
+
+As a developer whose backend is genuinely misconfigured (e.g., broken
+`docker-compose.yml`, missing image, network DNS issue), I want quick,
+clear failures with a cooldown between restart attempts — not a storm
+of `docker compose up -d` invocations that compete for Docker daemon
+resources.
+
+Acceptance criteria:
+- Setup: `lifecycle.start` always fails, or healthcheck never passes.
+- Client issues repeated `tools/call`s.
+- Each restart attempt respects `FAILURE_COOLDOWN_MIDSESSION = 5s`
+  between attempts when the prior failure was tagged `midsession`.
+- Each restart attempt respects `FAILURE_COOLDOWN_START` (existing value)
+  when the prior failure was tagged `start`.
+- Client sees `INTERNAL_ERROR` JSON-RPC responses with informative error
+  messages distinguishing "transport died during X; restart failed: Y"
+  (FR-22.2) from "Backend failed recently" (FR-6.4).
+- No more than one `lifecycle.start` invocation is in flight at any time.
 
 ---
 
@@ -870,6 +1020,9 @@ Acceptance criteria:
 | RAM savings vs direct connection | > 90% | ~25MB proxy vs ~300-500MB typical backend stack when idle |
 | Backend stop on session end | 100% | Verify no backend processes after MCP client exit (SIGTERM path) |
 | stdout contamination | 0 bytes of non-JSON-RPC | `stdout | jq -c .` must never fail on a line (FR-19.4) |
+| Mid-session transport recovery rate (FR-22) | 100% on a co-operating backend that restarts cleanly | Smoke test: kill backend container between `tools/call` #1 and #2; assert #2 succeeds without client-side retry; assert the first retry is NOT cooldown-gated (FR-22.5); assert `lifecycle.start` ran exactly once even for concurrent #2 calls (FR-22.6). |
+| Restart-attempt deduplication under concurrent failure (FR-22.6) | 1 `lifecycle.start` invocation per death event, independent of N concurrent failing calls | Instrumented smoke test counting subprocess invocations; verified across N ∈ {1, 5, 10}. |
+| Retry wall-time cap (FR-22.3) | Recovery completes or fails within `min(lifecycle.start.timeout, 60s)` from detection | Smoke test with an artificially slow `lifecycle.start` (90s sleep) — proxy MUST surface LifecycleError by 60 s, not wait 90 s. |
 
 ### 6.2 Post-MVP metrics
 
@@ -895,7 +1048,12 @@ Targets to verify when each respective feature ships.
 | Binary compilation breaks on specific dependency | Low | Low | Fallback to standard package distribution. Post-MVP concern. |
 | MCP protocol evolution breaks proxy | Low | Low | Proxy is thin pass-through (FR-20) — protocol changes affect transport layer only. SDK tracks protocol changes. |
 | MCP clients change startup behavior (stop probing `tools/list`) | Low | Very Low | Proxy is still useful as resource manager (idle shutdown). Monitor MCP ecosystem. |
-| SSE reconnection edge cases (network flaps, timeouts) | Medium | Medium | Auto-reconnect explicitly out of scope v1 (see §4); rely on MCP client retry behaviour. Revisit if production usage proves insufficient. |
+| SSE / HTTP / stdio mid-session transport death (container restart, crash, network flap) | High | High (any long-lived backend) | FR-22: detect, restart, retry once. FR-22.6 dedupes concurrent failures to a single restart; FR-22.5 applies a 5 s cooldown between mid-session restart attempts. Active liveness probing remains out of scope (§4). |
+| First call after very long idle still sees a stream error despite FR-22 (SDK streams already closed without the proxy noticing) | Medium | Low-Medium | Same recovery path as any other mid-session death. If observed frequently, escalate to active probing (post-MVP). |
+| Retry storm on N concurrent client tool calls after a single backend death | High | Medium (clients may batch tool uses) | FR-22.6 proxy-wide deduplication. Smoke test asserts one `lifecycle.start` per death event for N ∈ {1, 5, 10}. |
+| Future client-side retry (hypothetical) compounds with inline retry | Medium | Low | FR-22's recovery is idempotent under external retry — dedup + cooldown bound the total `lifecycle.start` rate regardless of who initiated the retry. |
+| Client times out during a slow restart (retry wall time > client tool-call timeout) | Medium | Medium | FR-22.3 caps recovery at `min(lifecycle.start.timeout, 60s)`. For backends with legitimately slow starts, operators should tune `lifecycle.start.timeout` below the client's tool-call timeout. |
+| Operator confused by new `Backend failed recently` cooldown messages after FR-22 ships | Low | Medium | Pre-FR-22 the cooldown path was unreachable on mid-session failures (state stayed ACTIVE). CHANGELOG entry MUST document the new 5 s mid-session cooldown so existing users understand the new log line. |
 | Concurrent `tools/call` race conditions in state machine | Medium | Medium | Careful async locking. State transitions protected by async lock primitives. Comprehensive integration tests. |
 | MCP client timeouts on `tools/list` during cold bootstrap | High | High (first run) | FR-13 warm CLI pre-builds cache. FR-14 progress notifications keep connection alive. Document client-side timeout configuration. |
 | Proxy receives SIGKILL (client crash) — backend left running | Medium | Medium | FR-15 startup cleanup detects and reuses orphan backends. Idle timeout (post-MVP) limits orphan lifetime. |
